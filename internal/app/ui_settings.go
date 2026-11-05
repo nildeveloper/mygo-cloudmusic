@@ -46,6 +46,10 @@ func (a *app) changed() {
 	if a.notch != nil {
 		a.notch.setEnabled(a.settings.Notch)
 	}
+	if runtime.GOOS == "darwin" {
+		a.syncDock()
+		a.applyTray()
+	}
 	a.redraw()
 }
 
@@ -95,7 +99,30 @@ func (a *app) settingsView(c *ui.Context) {
 							}
 						}
 						a.changed()
-						a.changeAppIcon()
+					}
+				})
+			})
+		}
+
+		if runtime.GOOS == "darwin" {
+			group("菜单栏与 Touch Bar", func() {
+				desc := "直接在菜单栏切换歌曲与播放、暂停"
+				if !showsTray(*s) {
+					desc = "请先将应用图标设为包含菜单栏的选项"
+				}
+				row("菜单栏播放控制", desc, func() {
+					if ui.Switch(c.Key("menu-controls"), &s.MenuBarControls).Label("菜单栏播放控制").Disabled(!showsTray(*s)).Changed() {
+						a.changed()
+					}
+				})
+				row("菜单栏歌词", "随播放显示当前歌词，长句自动滚动", func() {
+					if ui.Switch(c.Key("menu-lyrics"), &s.MenuBarLyrics).Label("菜单栏歌词").Disabled(!showsTray(*s)).Changed() {
+						a.changed()
+					}
+				})
+				row("Touch Bar 歌词", "在配备 Touch Bar 的 Mac 上，应用前台时显示播放控制与歌词", func() {
+					if ui.Switch(c.Key("touch-lyrics"), &s.TouchBarLyrics).Label("Touch Bar 歌词").Changed() {
+						a.changed()
 					}
 				})
 			})

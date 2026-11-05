@@ -41,6 +41,7 @@ jobs:
           fi
 
   build:
+    if: github.repository == 'egoist/mygo-cloudmusic'
     needs: draft-release
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -90,3 +91,39 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
         run: go tool mygo build -platform "${{ matrix.platform }}" -upload
+
+  fork-macos:
+    if: github.repository != 'egoist/mygo-cloudmusic'
+    needs: draft-release
+    name: macOS ARM64 (fork)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # Forks do not own the upstream signing identity or updater key.
+      # Only the build copy is changed; upstream releases keep their configuration.
+      - name: Configure a standalone fork build
+        run: |
+          jq 'del(.updates, .macos.signingIdentity, .macos.notarize)' mygo.json > "$RUNNER_TEMP/mygo.json"
+          mv "$RUNNER_TEMP/mygo.json" mygo.json
+      - name: Check system player regressions
+        run: |
+          go tool mygo vet .
+          go test ./internal/systemplayer ./internal/app ./internal/player -run 'Test(MenuLyrics|ConfigurePresentations|EnvironmentRefresh|SystemPlayer|Marquee|RepeatOneNotifies|LyricsCompletion|WhiteIcon)' -count=5
+      - name: Build macOS ARM64
+        run: go tool mygo build -platform darwin/arm64 -sign - -skip-notarize
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(jq -r .version mygo.json)"
+          slug="$(jq -r .slug mygo.json)"
+          name="$(jq -r .name mygo.json)"
+          cd build/darwin-arm64
+          codesign --verify --deep --strict "$name.app"
+          ditto -c -k --sequesterRsrc --keepParent "$name.app" "$slug-$version-arm64.zip"
+          shasum -a 256 ./*.dmg ./*.zip > SHA256SUMS.txt
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            ./*.dmg ./*.zip SHA256SUMS.txt --clobber

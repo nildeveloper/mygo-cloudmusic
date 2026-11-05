@@ -39,12 +39,13 @@ type route struct {
 // app is the state both windows show. Everything in it is read and changed
 // on the main thread: by the views, and by goroutines through post.
 type app struct {
-	win   *mygo.Window
-	notch *notch
-	tray  *mygo.Tray // the icon in the menu bar or notification area, while it shows
-	art   *artCache
-	pl    *player.Player
-	pal   palette
+	win          *mygo.Window
+	notch        *notch
+	systemPlayer *systemPlayer
+	tray         *mygo.Tray // the icon in the menu bar or notification area, while it shows
+	art          *artCache
+	pl           *player.Player
+	pal          palette
 
 	route   route
 	history []route
@@ -221,6 +222,7 @@ func Run() error {
 		a.pl.Changed = func() {
 			a.keepSession()
 			a.syncCaptions()
+			a.systemPlayer.sync()
 		}
 		a.volume = a.settings.Volume
 		a.pl.SetVolume(a.volume)
@@ -255,6 +257,7 @@ func Run() error {
 		a.win.OnHide(a.syncDock)
 		// Shown or switched to the morning after, it shows the new day's.
 		a.win.OnFocus(a.freshenHome)
+		a.initSystemPlayer()
 		a.applyTray()
 		if shotHook != nil {
 			shotHook(a)
@@ -276,6 +279,7 @@ func Run() error {
 	})
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
 		a.quitting = true
+		a.systemPlayer.close()
 		a.settings.Volume = a.volume
 		a.settings.save()
 		a.saveSession()
