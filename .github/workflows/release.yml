@@ -131,3 +131,22 @@ jobs:
               existing+=$'\n'"${file##*/}"
             fi
           done
+
+  checksums:
+    if: ${{ !cancelled() && github.repository != 'egoist/mygo-cloudmusic' && needs.draft-release.result == 'success' }}
+    needs: [draft-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      # Standalone builds have no signed updater manifest. Hash the release's
+      # actual packages after uploads, including packages from earlier runs.
+      - name: Update standalone package checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.draft-release.outputs.tag }}
+        run: |
+          mkdir packages
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir packages \
+            --pattern '*.dmg' --pattern '*.zip' --pattern '*-setup-*.exe' \
+            --pattern '*.deb' --pattern '*.tar.gz' --pattern install.sh
+          (cd packages && sha256sum *) > SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" SHA256SUMS.txt --clobber
