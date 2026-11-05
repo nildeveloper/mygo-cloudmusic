@@ -7,6 +7,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write # the draft release, and the uploads to it
@@ -14,18 +15,28 @@ permissions:
 jobs:
   draft-release:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
       # mygo build uploads to the release of mygo.json's version, whichever
       # tag started the workflow.
       - name: Check the version
-        run: test "$GITHUB_REF_NAME" = "v$(jq -r .version mygo.json)"
+        id: version
+        run: |
+          tag="v$(jq -r .version mygo.json)"
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            test "$GITHUB_REF_NAME" = "$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       # mygo build puts the version's section of CHANGELOG.md in the update
       # manifests, which the update window shows; the release page gets the
       # same notes, in place of GitHub's from the pull requests.
       - name: Take the notes from the changelog
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          awk -v heading="## ${GITHUB_REF_NAME#v}" '
+          awk -v heading="## ${RELEASE_TAG#v}" '
             /^## / { inside = ($0 == heading); next }
             inside
           ' CHANGELOG.md | sed '/./,$!d' > "$RUNNER_TEMP/notes.md"
@@ -34,14 +45,14 @@ jobs:
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.md"
           fi
 
   build:
-    if: github.repository == 'egoist/mygo-cloudmusic'
     needs: draft-release
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -54,6 +65,8 @@ jobs:
           - { name: Linux, os: ubuntu-latest, platform: "linux/amd64,linux/arm64" }
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.draft-release.outputs.tag }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -64,7 +77,7 @@ jobs:
       # mygo.json, notarizes its disk image. Both go in a keychain of the
       # job, made the default one, where codesign and notarytool look.
       - name: Import the certificate and the notary credentials
-        if: matrix.name == 'macOS'
+        if: matrix.name == 'macOS' && github.repository == 'egoist/mygo-cloudmusic'
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -86,44 +99,54 @@ jobs:
           security default-keychain -d user -s "$keychain"
           xcrun notarytool store-credentials notary --keychain "$keychain" \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+      # Forks use the same builder and packages without upstream credentials.
+      - name: Configure standalone fork signing
+        if: github.repository != 'egoist/mygo-cloudmusic'
+        run: |
+          jq 'del(.updates, .macos.notarize) | .macos.signingIdentity = "-"' \
+            mygo.json > "$RUNNER_TEMP/mygo.json"
+          mv "$RUNNER_TEMP/mygo.json" mygo.json
       - name: Build and upload
         env:
           GH_TOKEN: ${{ github.token }}
           MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
-        run: go tool mygo build -platform "${{ matrix.platform }}" -upload
-
-  fork-macos:
-    if: github.repository != 'egoist/mygo-cloudmusic'
-    needs: draft-release
-    name: macOS ARM64 (fork)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      # Forks do not own the upstream signing identity or updater key.
-      # Only the build copy is changed; upstream releases keep their configuration.
-      - name: Configure a standalone fork build
         run: |
-          jq 'del(.updates, .macos.signingIdentity, .macos.notarize)' mygo.json > "$RUNNER_TEMP/mygo.json"
-          mv "$RUNNER_TEMP/mygo.json" mygo.json
-      - name: Check system player regressions
-        run: |
-          go tool mygo vet .
-          go test ./internal/systemplayer ./internal/app ./internal/player -run 'Test(MenuLyrics|ConfigurePresentations|EnvironmentRefresh|SystemPlayer|Marquee|RepeatOneNotifies|LyricsCompletion|WhiteIcon)' -count=5
-      - name: Build macOS ARM64
-        run: go tool mygo build -platform darwin/arm64 -sign - -skip-notarize
-      - name: Package and upload
+          upload=()
+          if [ "$GITHUB_REPOSITORY" = egoist/mygo-cloudmusic ]; then upload=(-upload); fi
+          go tool mygo build -platform "${{ matrix.platform }}" "${upload[@]}"
+      # -upload requires an updater private key. Upload the builder's existing
+      # packages directly for standalone forks, keeping assets already published.
+      - name: Upload missing fork packages
+        if: github.repository != 'egoist/mygo-cloudmusic'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.draft-release.outputs.tag }}
         run: |
-          version="$(jq -r .version mygo.json)"
-          slug="$(jq -r .slug mygo.json)"
-          name="$(jq -r .name mygo.json)"
-          cd build/darwin-arm64
-          codesign --verify --deep --strict "$name.app"
-          ditto -c -k --sequesterRsrc --keepParent "$name.app" "$slug-$version-arm64.zip"
-          shasum -a 256 ./*.dmg ./*.zip > SHA256SUMS.txt
-          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            ./*.dmg ./*.zip SHA256SUMS.txt --clobber
+          existing="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          find build -type f \( -name '*.dmg' -o -name '*-setup-*.exe' \
+            -o -name '*.deb' -o -name '*.tar.gz' -o -name install.sh \) -print0 |
+          while IFS= read -r -d '' file; do
+            if ! grep -Fxq "${file##*/}" <<< "$existing"; then
+              gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$file"
+              existing+=$'\n'"${file##*/}"
+            fi
+          done
+
+  checksums:
+    if: ${{ !cancelled() && github.repository != 'egoist/mygo-cloudmusic' && needs.draft-release.result == 'success' }}
+    needs: [draft-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      # Standalone builds have no signed updater manifest. Hash the release's
+      # actual packages after uploads, including packages from earlier runs.
+      - name: Update standalone package checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.draft-release.outputs.tag }}
+        run: |
+          mkdir packages
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir packages \
+            --pattern '*.dmg' --pattern '*.zip' --pattern '*-setup-*.exe' \
+            --pattern '*.deb' --pattern '*.tar.gz' --pattern install.sh
+          (cd packages && sha256sum *) > SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" SHA256SUMS.txt --clobber
