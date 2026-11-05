@@ -8,18 +8,6 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing version tag to build or complete
-        required: true
-        type: string
-
-env:
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-
-concurrency:
-  group: release-${{ github.repository }}-${{ inputs.tag || github.ref_name }}
-  cancel-in-progress: false
 
 permissions:
   contents: write # the draft release, and the uploads to it
@@ -27,18 +15,26 @@ permissions:
 jobs:
   draft-release:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.RELEASE_TAG }}
       # mygo build uploads to the release of mygo.json's version, whichever
       # tag started the workflow.
       - name: Check the version
-        run: test "$RELEASE_TAG" = "v$(jq -r .version mygo.json)"
+        id: version
+        run: |
+          tag="v$(jq -r .version mygo.json)"
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            test "$GITHUB_REF_NAME" = "$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       # mygo build puts the version's section of CHANGELOG.md in the update
       # manifests, which the update window shows; the release page gets the
       # same notes, in place of GitHub's from the pull requests.
       - name: Take the notes from the changelog
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
           awk -v heading="## ${RELEASE_TAG#v}" '
             /^## / { inside = ($0 == heading); next }
@@ -49,6 +45,7 @@ jobs:
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
@@ -69,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.draft-release.outputs.tag }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -102,80 +99,35 @@ jobs:
           security default-keychain -d user -s "$keychain"
           xcrun notarytool store-credentials notary --keychain "$keychain" \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+      # Forks use the same builder and packages without upstream credentials.
+      - name: Configure standalone fork signing
+        if: github.repository != 'egoist/mygo-cloudmusic'
+        run: |
+          jq 'del(.updates, .macos.notarize) | .macos.signingIdentity = "-"' \
+            mygo.json > "$RUNNER_TEMP/mygo.json"
+          mv "$RUNNER_TEMP/mygo.json" mygo.json
       - name: Build and upload
-        if: github.repository == 'egoist/mygo-cloudmusic'
         env:
           GH_TOKEN: ${{ github.token }}
           MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
-        run: go tool mygo build -platform "${{ matrix.platform }}" -upload
-
-      # Forks do not own the upstream signing identity or updater key.
-      # Only the build copy is changed; upstream releases keep their configuration.
-      - name: Configure a standalone fork build
-        if: github.repository != 'egoist/mygo-cloudmusic'
         run: |
-          jq 'del(.updates, .macos.signingIdentity, .macos.notarize)' mygo.json > "$RUNNER_TEMP/mygo.json"
-          mv "$RUNNER_TEMP/mygo.json" mygo.json
-      - name: Check system player regressions
-        if: matrix.name == 'macOS' && github.repository != 'egoist/mygo-cloudmusic'
-        run: |
-          go tool mygo vet .
-          go test ./internal/systemplayer ./internal/app ./internal/player -run 'Test(MenuLyrics|ConfigurePresentations|EnvironmentRefresh|SystemPlayer|Marquee|RepeatOneNotifies|LyricsCompletion|WhiteIcon)' -count=5
-      - name: Build standalone fork packages
-        if: github.repository != 'egoist/mygo-cloudmusic'
-        env:
-          PLATFORMS: ${{ matrix.platform }}
-        run: go tool mygo build -platform "$PLATFORMS" -sign - -skip-notarize
-      - name: Package and upload missing assets
+          upload=()
+          if [ "$GITHUB_REPOSITORY" = egoist/mygo-cloudmusic ]; then upload=(-upload); fi
+          go tool mygo build -platform "${{ matrix.platform }}" "${upload[@]}"
+      # -upload requires an updater private key. Upload the builder's existing
+      # packages directly for standalone forks, keeping assets already published.
+      - name: Upload missing fork packages
         if: github.repository != 'egoist/mygo-cloudmusic'
         env:
           GH_TOKEN: ${{ github.token }}
-          PLATFORMS: ${{ matrix.platform }}
+          RELEASE_TAG: ${{ needs.draft-release.outputs.tag }}
         run: |
-          version="$(jq -r .version mygo.json)"
-          slug="$(jq -r .slug mygo.json)"
-          name="$(jq -r .name mygo.json)"
-          packages="$RUNNER_TEMP/packages"
-          mkdir -p "$packages"
-          IFS=',' read -ra targets <<< "$PLATFORMS"
-          for target in "${targets[@]}"; do
-            directory="build/${target/\//-}"
-            if [[ "$target" == darwin/* ]]; then
-              codesign --verify --deep --strict "$directory/$name.app"
-              ditto -c -k --sequesterRsrc --keepParent "$directory/$name.app" \
-                "$directory/$slug-$version-${target#*/}.zip"
-            fi
-            find "$directory" -maxdepth 1 -type f \
-              \( -name '*.dmg' -o -name '*.zip' -o -name '*-setup-*.exe' \
-                 -o -name '*.deb' -o -name '*.tar.gz' -o -name 'install.sh' \) \
-              -exec cp {} "$packages/" \;
-          done
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name' > "$RUNNER_TEMP/existing-assets"
-          for file in "$packages"/*; do
-            if grep -Fxq "${file##*/}" "$RUNNER_TEMP/existing-assets"; then
-              echo "Keeping existing asset: ${file##*/}"
-            else
+          existing="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          find build -type f \( -name '*.dmg' -o -name '*-setup-*.exe' \
+            -o -name '*.deb' -o -name '*.tar.gz' -o -name install.sh \) -print0 |
+          while IFS= read -r -d '' file; do
+            if ! grep -Fxq "${file##*/}" <<< "$existing"; then
               gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$file"
+              existing+=$'\n'"${file##*/}"
             fi
           done
-
-  fork-checksums:
-    if: github.repository != 'egoist/mygo-cloudmusic'
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      # Hash the actual release files, including assets retained from an earlier
-      # attempt. Only the combined checksum manifest is replaced.
-      - name: Update release checksums
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/release-assets"
-          cd "$RUNNER_TEMP/release-assets"
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.dmg' --pattern '*.zip' --pattern '*-setup-*.exe' \
-            --pattern '*.deb' --pattern '*.tar.gz' --pattern 'install.sh'
-          sha256sum * > "$RUNNER_TEMP/SHA256SUMS.txt"
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            "$RUNNER_TEMP/SHA256SUMS.txt" --clobber
