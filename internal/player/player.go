@@ -98,11 +98,16 @@ func New(post func(func())) *Player {
 	return p
 }
 
+// notifyChanged publishes complete state without updating system media metadata.
+func (p *Player) notifyChanged() {
+	if p.Changed != nil {
+		p.Changed()
+	}
+}
+
 // sync shows the system, and Changed, where playback is.
 func (p *Player) sync() {
-	if p.Changed != nil {
-		defer p.Changed()
-	}
+	defer p.notifyChanged()
 	if p.track == nil {
 		mygo.NowPlaying.Clear()
 		return
@@ -136,6 +141,7 @@ func (p *Player) ended() {
 	if p.repeat == RepeatOne {
 		p.out.Seek(0)
 		p.out.Play()
+		p.sync()
 		return
 	}
 	if p.at+1 >= len(p.order) && p.feed != nil {
@@ -588,6 +594,7 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 	p.lyrics, p.lyricsLoaded = nil, false
 	p.pending = from
 	p.announce(&t, nil)
+	p.notifyChanged()
 	p.refill()
 
 	go func() {
@@ -608,10 +615,7 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 			lines = lyrics.Build(lrc, trans, yrc)
 		}
 		p.post(func() {
-			if gen == p.gen {
-				p.lyrics = lines
-				p.lyricsLoaded = true
-			}
+			p.acceptLyrics(gen, lines)
 		})
 	}()
 	go func() {
@@ -678,6 +682,15 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 			p.sync()
 		})
 	}()
+}
+
+// acceptLyrics publishes a completed lyric load only for the track still current.
+func (p *Player) acceptLyrics(gen int, lines []lyrics.Line) {
+	if gen != p.gen {
+		return
+	}
+	p.lyrics, p.lyricsLoaded = lines, true
+	p.notifyChanged()
 }
 
 // open opens track t's audio at level: kept in the cache, or else

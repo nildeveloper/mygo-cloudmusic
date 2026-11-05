@@ -66,17 +66,11 @@ func (a *app) syncDock() {
 	}
 }
 
-// changeAppIcon shows the app's icon where the settings now say, as the
-// listener chose another place for it.
-func (a *app) changeAppIcon() {
-	a.syncDock()
-	a.applyTray()
-}
-
 // applyTray adds or removes the icon in the menu bar or notification area,
 // as the settings say.
 func (a *app) applyTray() {
-	switch show := showsTray(a.settings); {
+	custom := a.systemPlayer.apply()
+	switch show := showsTray(a.settings) && !custom; {
 	case show && a.tray == nil:
 		icon, template := trayColor, false
 		if runtime.GOOS == "darwin" {
@@ -98,7 +92,10 @@ func (a *app) applyTray() {
 
 // trayMenu is the icon's menu: the window, the player's controls,
 // settings, updates, and quitting.
-func (a *app) trayMenu() *mygo.Menu {
+func (a *app) trayMenu() *mygo.Menu { return a.playbackMenu(true) }
+
+// playbackMenu keeps application actions shared; system controls omit likes.
+func (a *app) playbackMenu(withLike bool) *mygo.Menu {
 	run := func(fn func()) func(*mygo.MenuItem, *mygo.Window) {
 		return func(*mygo.MenuItem, *mygo.Window) {
 			fn()
@@ -113,17 +110,22 @@ func (a *app) trayMenu() *mygo.Menu {
 		}
 	}
 	name := mygo.App.Name()
-	return mygo.NewMenu([]*mygo.MenuItem{
+	items := []*mygo.MenuItem{
 		{Label: "打开" + name, Click: run(a.showMain)},
 		mygo.Separator(),
 		{Label: "播放/暂停", Click: run(func() { a.pl.TogglePlay() })},
 		{Label: "下一首", Click: run(func() { a.pl.Next() })},
 		{Label: "上一首", Click: run(func() { a.pl.Prev() })},
-		{Label: "喜欢/取消喜欢", Click: run(a.likeCurrent)},
+	}
+	if withLike {
+		items = append(items, &mygo.MenuItem{Label: "喜欢/取消喜欢", Click: run(a.likeCurrent)})
+	}
+	items = append(items,
 		mygo.Separator(),
-		{Label: "设置…", Click: run(front(a.openSettings))},
-		{Label: "检查更新…", Click: run(front(checkForUpdates))},
+		&mygo.MenuItem{Label: "设置…", Click: run(front(a.openSettings))},
+		&mygo.MenuItem{Label: "检查更新…", Click: run(front(checkForUpdates))},
 		mygo.Separator(),
-		{Label: "退出" + name, Click: func(*mygo.MenuItem, *mygo.Window) { mygo.App.Quit() }},
-	})
+		&mygo.MenuItem{Label: "退出" + name, Click: func(*mygo.MenuItem, *mygo.Window) { mygo.App.Quit() }},
+	)
+	return mygo.NewMenu(items)
 }
