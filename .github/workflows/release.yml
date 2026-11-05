@@ -106,6 +106,33 @@ jobs:
           jq 'del(.updates, .macos.notarize) | .macos.signingIdentity = "-"' \
             mygo.json > "$RUNNER_TEMP/mygo.json"
           mv "$RUNNER_TEMP/mygo.json" mygo.json
+      # Match paste-rs: use the P12 directly, without importing a keychain.
+      - name: Prepare rcodesign for fork releases
+        if: matrix.name == 'macOS' && github.repository != 'egoist/mygo-cloudmusic'
+        env:
+          SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+        run: |
+          test -n "$SIGNING_P12_BASE64" || { echo "Missing MACOS_SIGNING_P12_BASE64 secret" >&2; exit 1; }
+          test -n "$SIGNING_P12_PASSWORD" || { echo "Missing MACOS_SIGNING_P12_PASSWORD secret" >&2; exit 1; }
+          umask 077
+          signing_dir="$RUNNER_TEMP/mygo-signing"
+          mkdir -p "$signing_dir"
+          python3 - <<'PY'
+          import base64, os
+          with open(os.environ["RUNNER_TEMP"] + "/mygo-signing/certificate.p12", "wb") as f:
+              f.write(base64.b64decode(os.environ["SIGNING_P12_BASE64"], validate=True))
+          PY
+          printf '%s' "$SIGNING_P12_PASSWORD" > "$signing_dir/password"
+          rcodesign_version="0.29.0"
+          rcodesign_sha256="d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d"
+          curl -fL --retry 3 \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${rcodesign_version}/apple-codesign-${rcodesign_version}-macos-universal.tar.gz" \
+            -o "$signing_dir/rcodesign.tar.gz"
+          printf '%s  %s\n' "$rcodesign_sha256" "$signing_dir/rcodesign.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$signing_dir/rcodesign.tar.gz" -C "$signing_dir" --strip-components=1
+          test -x "$signing_dir/rcodesign"
+          "$signing_dir/rcodesign" --version
       - name: Build and upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -114,6 +141,70 @@ jobs:
           upload=()
           if [ "$GITHUB_REPOSITORY" = egoist/mygo-cloudmusic ]; then upload=(-upload); fi
           go tool mygo build -platform "${{ matrix.platform }}" "${upload[@]}"
+      # The builder has already packaged the app. Sign inside a writable copy
+      # of each DMG so its Finder layout and volume icon remain intact.
+      - name: Sign and verify fork macOS packages
+        if: matrix.name == 'macOS' && github.repository != 'egoist/mygo-cloudmusic'
+        run: |
+          signing_dir="$RUNNER_TEMP/mygo-signing"
+          work="$(mktemp -d "$RUNNER_TEMP/mygo-dmg.XXXXXX")"
+          mounted=false
+          cleanup() {
+            if [ "$mounted" = true ]; then hdiutil detach -force "$work/mount" || return; fi
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          name="$(jq -r .name mygo.json)"
+          identifier="$(jq -r .identifier mygo.json)"
+          sign() {
+            "$signing_dir/rcodesign" sign \
+              --p12-file "$signing_dir/certificate.p12" \
+              --p12-password-file "$signing_dir/password" "$1"
+          }
+          for arch in arm64 amd64; do
+            packages=(build/darwin-"$arch"/*.dmg)
+            test "${#packages[@]}" = 1
+            test -f "${packages[0]}"
+            dmg="${packages[0]}"
+            hdiutil convert "$dmg" -format UDRW -o "$work/writable.dmg"
+            # Certificate signatures need more space than the ad hoc original.
+            size_mb="$(( $(stat -f %z "$work/writable.dmg") / 1048576 + 32 ))"
+            hdiutil resize -size "${size_mb}m" "$work/writable.dmg"
+            mkdir -p "$work/mount"
+            hdiutil attach "$work/writable.dmg" -readwrite -nobrowse -noautoopen -mountpoint "$work/mount"
+            mounted=true
+            app="$work/mount/$name.app"
+            sign "$app"
+            codesign --verify --deep --strict "$app"
+            codesign -d --extract-certificates="$work/certificate-" "$app"
+            test -s "$work/certificate-0" # A real certificate, not ad hoc.
+            requirement="$(codesign -d -r- "$app" 2>&1)"
+            grep -Fq "identifier \"$identifier\"" <<< "$requirement"
+            printf '%s\n' "$requirement"
+            hdiutil detach "$work/mount"
+            mounted=false
+            hdiutil convert "$work/writable.dmg" -format ULMO -o "$work/signed.dmg"
+            sign "$work/signed.dmg"
+            hdiutil verify "$work/signed.dmg"
+            codesign --verify --strict "$work/signed.dmg"
+            # Validate the actual downloadable image, not only its writable input.
+            hdiutil attach "$work/signed.dmg" -readonly -nobrowse -noautoopen -mountpoint "$work/mount"
+            mounted=true
+            codesign --verify --deep --strict "$app"
+            codesign -d --extract-certificates="$work/final-certificate-" "$app"
+            cmp "$work/certificate-0" "$work/final-certificate-0"
+            executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            expected_arch="$arch"
+            if [ "$arch" = amd64 ]; then expected_arch=x86_64; fi
+            test "$(lipo -archs "$app/Contents/MacOS/$executable")" = "$expected_arch"
+            hdiutil detach "$work/mount"
+            mounted=false
+            mv "$work/signed.dmg" "$dmg"
+            rm "$work/writable.dmg" "$work/certificate-"* "$work/final-certificate-"*
+          done
+      - name: Remove fork signing credentials
+        if: ${{ always() && matrix.name == 'macOS' && github.repository != 'egoist/mygo-cloudmusic' }}
+        run: rm -rf "$RUNNER_TEMP/mygo-signing"
       # -upload requires an updater private key. Upload the builder's existing
       # packages directly for standalone forks, keeping assets already published.
       - name: Upload missing fork packages
