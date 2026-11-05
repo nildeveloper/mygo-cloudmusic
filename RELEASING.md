@@ -2,17 +2,56 @@
 
 ## This fork
 
-The feature branch is `features/system-player`. Release tags still come from
-`main`, after the feature and version commits have been pushed there.
+Release tags come from `main`, after the feature and version commits have been
+merged there. Signing changes live on `features/macos-signing`.
 
-For repositories other than `egoist/mygo-cloudmusic`, the release workflow builds
-only macOS ARM64. It removes upstream update and signing configuration from the
-build copy, uses ad hoc signing, and uploads a DMG, ZIP and `SHA256SUMS.txt` to this
-repository's draft release. These builds are not notarized and do not support
-in-app automatic updates; download new versions from this fork's Releases page.
-The release notes must state these limitations. Wait for the fork job to succeed
-and verify its assets before publishing the draft. Do not deploy the upstream
+The workflow uses the original macOS, Windows and Linux matrix (ARM64 and x64).
+Forks remove upstream update and notarization configuration from the build copy
+and upload the builder's packages to their own repository. macOS packages are
+then signed with the fork's P12 before upload. These builds are not notarized and
+do not support in-app automatic updates; download new versions from this fork's
+Releases page. The release notes must state these limitations. Wait for every
+build and checksum job to succeed before publishing. Do not deploy the upstream
 website or check its update feed for a fork release.
+
+### macOS P12 signing
+
+Reuse the signing setup from
+[paste-rs](https://github.com/nildeveloper/paste-rs/blob/main/.github/workflows/build.yml):
+`rcodesign` 0.29.0, with its archive SHA-256 pinned in the workflow. Configure
+these **repository Actions secrets** in this repository's Settings → Secrets
+and variables → Actions (secrets in another repository are not inherited):
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_SIGNING_P12_BASE64` | Base64 of the P12 containing the signing certificate and private key |
+| `MACOS_SIGNING_P12_PASSWORD` | The P12 export password |
+
+On your Mac, copy the certificate data to the clipboard with
+`base64 -i /path/to/certificate.p12 | tr -d '\n' | pbcopy`, then paste it into the
+first secret. Keep using the same P12 across versions for a stable signing
+identity. Neither the P12 nor its password belongs in the repository.
+
+macOS releases require both secrets and fail if signing or verification fails;
+there is no ad hoc fallback. Temporary credential files are owner-only and
+removed even after a failed step. No keychain password, Apple ID or Apple team
+secret is needed for this path. A self-signed P12 provides a stable identity but
+does not provide Apple Developer ID trust or notarization.
+
+MyGo first builds its normal DMGs. The workflow converts each to a writable
+image, signs the app inside it, verifies the app signature and bundle identifier,
+then compresses and signs the DMG. It remounts the final image read-only and
+checks the app signature, signing certificate and target architecture again.
+This preserves MyGo's Finder layout and volume icon while ensuring the shipped
+app uses the P12. Both macOS architectures use
+the same certificate. Windows/Linux and the upstream signing path are unchanged.
+
+Use a **new version/tag** for the first signed release. Uploads intentionally
+skip existing asset names, so rerunning an old release will not replace its
+already-published ad hoc packages. `workflow_dispatch` checks out the version's
+tag for application code; it can retry packaging that version after configuring
+the secrets. The signing steps are kept inline so retrying an older tag does not
+depend on a new script existing in that tag.
 
 ## Upstream release procedure
 
