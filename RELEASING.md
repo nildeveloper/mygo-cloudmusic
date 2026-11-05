@@ -1,5 +1,21 @@
 # Releasing
 
+## This fork
+
+The feature branch is `features/system-player`. Release tags still come from
+`main`, after the feature and version commits have been pushed there.
+
+For repositories other than `egoist/mygo-cloudmusic`, the release workflow builds
+only macOS ARM64. It removes upstream update and signing configuration from the
+build copy, uses ad hoc signing, and uploads a DMG, ZIP and `SHA256SUMS.txt` to this
+repository's draft release. These builds are not notarized and do not support
+in-app automatic updates; download new versions from this fork's Releases page.
+The release notes must state these limitations. Wait for the fork job to succeed
+and verify its assets before publishing the draft. Do not deploy the upstream
+website or check its update feed for a fork release.
+
+## Upstream release procedure
+
 1. Commit pending work, bring main up to date with origin, and run `go test ./internal/...`. Others push to main too, so a release cut from a stale main leaves out their work:
 
    ```bash
