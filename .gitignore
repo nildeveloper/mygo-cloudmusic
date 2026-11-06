@@ -3,3 +3,6 @@
 mygo_windows_*.syso
 /netease-music-mygo
 /node_modules/
+
+# Private automatic-update key (the public key may be shared).
+mygo-update.key

@@ -25,6 +25,7 @@ const (
 	pageUser
 	pagePodcast
 	pagePodcasts
+	pageRecords
 )
 
 type route struct {
@@ -32,8 +33,9 @@ type route struct {
 	// id is the playlist, artist, album, user or podcast the page shows.
 	id int64
 	// query and kind are what a search page searched for.
-	query string
-	kind  netease.SearchType
+	query   string
+	kind    netease.SearchType
+	records recordTab // selected listening-record period
 }
 
 // app is the state both windows show. Everything in it is read and changed
@@ -42,6 +44,7 @@ type app struct {
 	win          *mygo.Window
 	notch        *notch
 	systemPlayer *systemPlayer
+	together     togetherPlayer
 	tray         *mygo.Tray // the icon in the menu bar or notification area, while it shows
 	art          *artCache
 	pl           *player.Player
@@ -62,6 +65,8 @@ type app struct {
 	liked        map[int64]bool // the songs the listener likes
 	toast        string         // a message to show once
 	picked       pickedUp       // the song a login picked up, waiting to play
+	records      recordState
+	scrobble     *scrobbler
 
 	// The episodes the listener likes, and doesn't, as far as NetEase has
 	// answered, and those asked about: see ui_like.go.
@@ -117,11 +122,12 @@ type app struct {
 	fmMode        int    // the FM mode chosen, in fmModes
 	radioStarting string // the radio asked for its first songs, or ""
 
-	scrub      float64
-	scrubbing  bool
-	volume     float64
-	volumeOpen bool // the volume popover of the player bar shows
-	mutedFrom  float64
+	scrub         float64
+	scrubbing     bool
+	volume        float64
+	volumeOpen    bool // the volume popover of the player bar shows
+	playbackError playbackErrorState
+	mutedFrom     float64
 
 	rowBars barState
 	// underTop and underBottom say whether the page has content under its
@@ -220,6 +226,7 @@ func Run() error {
 		a.pl.Normalize = func() bool { return a.settings.Normalize }
 		a.pl.Cache = newSongCache(a.settings.CacheMB)
 		a.pl.Changed = func() {
+			a.syncScrobble()
 			a.keepSession()
 			a.syncCaptions()
 			a.systemPlayer.sync()
@@ -277,8 +284,12 @@ func Run() error {
 			}
 		})
 	})
-	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
+	mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
 		a.quitting = true
+		if a.deferScrobbleQuit(e) {
+			return
+		}
+		a.stopTogether()
 		a.systemPlayer.close()
 		a.settings.Volume = a.volume
 		a.settings.save()

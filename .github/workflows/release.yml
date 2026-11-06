@@ -9,6 +9,14 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 permissions:
   contents: write # the draft release, and the uploads to it
 
@@ -19,8 +27,16 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
-      # mygo build uploads to the release of mygo.json's version, whichever
-      # tag started the workflow.
+        with:
+          fetch-depth: 0
+      - name: Check update signing configuration
+        env:
+          UPDATE_PUBLIC_KEY: ${{ vars.MYGO_UPDATER_PUBLIC_KEY }}
+          UPDATE_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
+        run: |
+          test -n "$UPDATE_PUBLIC_KEY" || { echo "Missing MYGO_UPDATER_PUBLIC_KEY variable" >&2; exit 1; }
+          test -n "$UPDATE_PRIVATE_KEY" || { echo "Missing MYGO_UPDATER_PRIVATE_KEY secret" >&2; exit 1; }
+      # Build only the version's tagged commit, even for manual runs.
       - name: Check the version
         id: version
         run: |
@@ -28,6 +44,8 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
             test "$GITHUB_REF_NAME" = "$tag"
           fi
+          # Manual runs must also build the tagged commit, including its notes.
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$tag^{commit}")"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       # mygo build puts the version's section of CHANGELOG.md in the update
       # manifests, which the update window shows; the release page gets the
@@ -47,7 +65,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true || {
+              echo "Refusing to replace an already published release; use a new version/tag" >&2; exit 1;
+            }
+          else
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
               --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.md"
           fi
@@ -73,42 +95,21 @@ jobs:
       - name: Install NSIS, for the Windows installers
         if: matrix.name == 'Windows'
         run: sudo apt-get update && sudo apt-get install -y nsis
-      # The certificate signs the app; the notary profile, "notary" in
-      # mygo.json, notarizes its disk image. Both go in a keychain of the
-      # job, made the default one, where codesign and notarytool look.
-      - name: Import the certificate and the notary credentials
-        if: matrix.name == 'macOS' && github.repository == 'egoist/mygo-cloudmusic'
+      # CI builds opt into this repository's feed. Local builds keep the
+      # manual Releases link, without any private signing material.
+      - name: Configure signed updates
         env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          UPDATE_PUBLIC_KEY: ${{ vars.MYGO_UPDATER_PUBLIC_KEY }}
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
         run: |
-          keychain="$RUNNER_TEMP/signing.keychain-db"
-          password="$(openssl rand -base64 24)"
-          security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
-            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          rm "$RUNNER_TEMP/certificate.p12"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain
-          security default-keychain -d user -s "$keychain"
-          xcrun notarytool store-credentials notary --keychain "$keychain" \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
-      # Forks use the same builder and packages without upstream credentials.
-      - name: Configure standalone fork signing
-        if: github.repository != 'egoist/mygo-cloudmusic'
-        run: |
-          jq 'del(.updates, .macos.notarize) | .macos.signingIdentity = "-"' \
+          jq 'del(.macos.notarize) | .macos.signingIdentity = "-" |
+            .updates = {publicKey: env.UPDATE_PUBLIC_KEY, github: env.GITHUB_REPOSITORY, deltas: 0}' \
             mygo.json > "$RUNNER_TEMP/mygo.json"
           mv "$RUNNER_TEMP/mygo.json" mygo.json
+          go run ./scripts/sign-update -check
       # Match paste-rs: use the P12 directly, without importing a keychain.
-      - name: Prepare rcodesign for fork releases
-        if: matrix.name == 'macOS' && github.repository != 'egoist/mygo-cloudmusic'
+      - name: Prepare rcodesign
+        if: matrix.name == 'macOS'
         env:
           SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
           SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
@@ -133,18 +134,17 @@ jobs:
           tar -xzf "$signing_dir/rcodesign.tar.gz" -C "$signing_dir" --strip-components=1
           test -x "$signing_dir/rcodesign"
           "$signing_dir/rcodesign" --version
-      - name: Build and upload
+      - name: Build installers and signed updates
         env:
-          GH_TOKEN: ${{ github.token }}
           MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
         run: |
-          upload=()
-          if [ "$GITHUB_REPOSITORY" = egoist/mygo-cloudmusic ]; then upload=(-upload); fi
-          go tool mygo build -platform "${{ matrix.platform }}" "${upload[@]}"
+          go tool mygo build -platform "${{ matrix.platform }}"
       # The builder has already packaged the app. Sign inside a writable copy
       # of each DMG so its Finder layout and volume icon remain intact.
-      - name: Sign and verify fork macOS packages
-        if: matrix.name == 'macOS' && github.repository != 'egoist/mygo-cloudmusic'
+      - name: Sign and verify macOS packages and updates
+        if: matrix.name == 'macOS'
+        env:
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
         run: |
           signing_dir="$RUNNER_TEMP/mygo-signing"
           work="$(mktemp -d "$RUNNER_TEMP/mygo-dmg.XXXXXX")"
@@ -156,6 +156,8 @@ jobs:
           trap cleanup EXIT
           name="$(jq -r .name mygo.json)"
           identifier="$(jq -r .identifier mygo.json)"
+          slug="$(jq -r .slug mygo.json)"
+          version="$(jq -r .version mygo.json)"
           sign() {
             "$signing_dir/rcodesign" sign \
               --p12-file "$signing_dir/certificate.p12" \
@@ -197,47 +199,66 @@ jobs:
             expected_arch="$arch"
             if [ "$arch" = amd64 ]; then expected_arch=x86_64; fi
             test "$(lipo -archs "$app/Contents/MacOS/$executable")" = "$expected_arch"
+            # Package the app from the verified final DMG, after P12 signing.
+            archive="$PWD/build/darwin-$arch/$slug-$version-darwin-$arch.tar.gz"
+            COPYFILE_DISABLE=1 tar -czf "$archive" -C "$work/mount" "$name.app"
+            mkdir "$work/extracted"
+            tar -xzf "$archive" -C "$work/extracted"
+            codesign --verify --deep --strict "$work/extracted/$name.app"
+            cmp "$app/Contents/MacOS/$executable" "$work/extracted/$name.app/Contents/MacOS/$executable"
+            rm -rf "$work/extracted"
+            go run ./scripts/sign-update \
+              -manifest "build/darwin-$arch/update-darwin-$arch.json" -archive "$archive"
             hdiutil detach "$work/mount"
             mounted=false
             mv "$work/signed.dmg" "$dmg"
             rm "$work/writable.dmg" "$work/certificate-"* "$work/final-certificate-"*
           done
-      - name: Remove fork signing credentials
-        if: ${{ always() && matrix.name == 'macOS' && github.repository != 'egoist/mygo-cloudmusic' }}
+      - name: Remove signing credentials
+        if: ${{ always() && matrix.name == 'macOS' }}
         run: rm -rf "$RUNNER_TEMP/mygo-signing"
-      # -upload requires an updater private key. Upload the builder's existing
-      # packages directly for standalone forks, keeping assets already published.
-      - name: Upload missing fork packages
-        if: github.repository != 'egoist/mygo-cloudmusic'
+      # Upload archives before manifests. Only draft releases may be rebuilt;
+      # clobber both together so a retry cannot leave mismatched signatures.
+      - name: Upload release packages and update manifests
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.draft-release.outputs.tag }}
         run: |
-          existing="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
           find build -type f \( -name '*.dmg' -o -name '*-setup-*.exe' \
-            -o -name '*.deb' -o -name '*.tar.gz' -o -name install.sh \) -print0 |
+            -o -name '*.deb' -o -name '*.tar.gz' -o -name install.sh -o -name install.ps1 \) -print0 |
           while IFS= read -r -d '' file; do
-            if ! grep -Fxq "${file##*/}" <<< "$existing"; then
-              gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$file"
-              existing+=$'\n'"${file##*/}"
-            fi
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$file" --clobber
+          done
+          find build -type f -name 'update-*.json' -print0 |
+          while IFS= read -r -d '' file; do
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$file" --clobber
           done
 
   checksums:
-    if: ${{ !cancelled() && github.repository != 'egoist/mygo-cloudmusic' && needs.draft-release.result == 'success' }}
     needs: [draft-release, build]
     runs-on: ubuntu-latest
     steps:
-      # Standalone builds have no signed updater manifest. Hash the release's
-      # actual packages after uploads, including packages from earlier runs.
-      - name: Update standalone package checksums
+      # All platforms must succeed before the draft is ready to publish.
+      - name: Verify completeness and update package checksums
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.draft-release.outputs.tag }}
         run: |
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
           mkdir packages
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir packages \
-            --pattern '*.dmg' --pattern '*.zip' --pattern '*-setup-*.exe' \
-            --pattern '*.deb' --pattern '*.tar.gz' --pattern install.sh
-          (cd packages && sha256sum *) > SHA256SUMS.txt
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" SHA256SUMS.txt --clobber
+            --pattern '*.dmg' --pattern '*-setup-*.exe' --pattern '*.deb' \
+            --pattern '*.tar.gz' --pattern install.sh --pattern install.ps1 --pattern 'update-*.json'
+          for platform in darwin windows linux; do
+            for arch in arm64 amd64; do
+              manifest="packages/update-$platform-$arch.json"
+              test "$(jq -r .version "$manifest")" = "${RELEASE_TAG#v}"
+              archive="$(jq -r .url "$manifest")"
+              archive="packages/${archive##*/}"
+              test "$(stat -c %s "$archive")" = "$(jq -r .size "$manifest")"
+            done
+          done
+          (cd packages && sha256sum *) > SHA256SUMS
+          cp SHA256SUMS SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" SHA256SUMS SHA256SUMS.txt --clobber

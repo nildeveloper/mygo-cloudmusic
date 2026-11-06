@@ -371,7 +371,11 @@ func (a *app) wallBar(c *ui.Context, accent ui.Color) {
 			})
 			a.transport(c, white, white.Alpha(0.45), white, 22)
 			ui.Row(c).Grow(1).Basis(0).MinWidth(0).Justify(ui.End).Children(func() {
-				ui.Text(c, "-"+clock(pl.Duration()-pl.Position())).FontSize(11.5).FontFeatures("tnum").TextColor(white.Alpha(0.5))
+				if pl.Err() != "" {
+					a.playbackErrorButton(c, white)
+				} else {
+					ui.Text(c, "-"+clock(pl.Duration()-pl.Position())).FontSize(11.5).FontFeatures("tnum").TextColor(white.Alpha(0.5))
+				}
 			})
 		})
 	})

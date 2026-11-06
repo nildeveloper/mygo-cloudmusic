@@ -123,7 +123,7 @@ func (a *app) playbackMenu(withLike bool) *mygo.Menu {
 	items = append(items,
 		mygo.Separator(),
 		&mygo.MenuItem{Label: "设置…", Click: run(front(a.openSettings))},
-		&mygo.MenuItem{Label: "检查更新…", Click: run(front(checkForUpdates))},
+		&mygo.MenuItem{Label: "检查更新…", Click: run(front(a.checkUpdates))},
 		mygo.Separator(),
 		&mygo.MenuItem{Label: "退出" + name, Click: func(*mygo.MenuItem, *mygo.Window) { mygo.App.Quit() }},
 	)

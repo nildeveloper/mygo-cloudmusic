@@ -97,6 +97,10 @@ func (a *app) radioFeed(name string) func(got func([]netease.Track)) {
 
 // playFM plays the personal FM in the mode chosen, or goes on playing it.
 func (a *app) playFM() {
+	if a.together.session != nil {
+		a.toast = "请先结束一起听，再播放电台"
+		return
+	}
 	name := fmRadio(fmModes[a.fmMode].mode)
 	if a.pl.Radio() == name {
 		if !a.pl.Playing() {
@@ -135,6 +139,9 @@ func (a *app) exitRadio() {
 
 // trashFM skips the song playing on the FM, which plays it no more.
 func (a *app) trashFM() {
+	if a.together.session != nil || a.pl.Radio() == "" {
+		return
+	}
 	tr := a.pl.Current()
 	if tr == nil {
 		return
@@ -147,6 +154,10 @@ func (a *app) trashFM() {
 // startHeartMode plays songs like one the listener likes: the one playing,
 // if they like it, or else one of their liked songs at random.
 func (a *app) startHeartMode() {
+	if a.together.session != nil {
+		a.toast = "请先结束一起听，再播放电台"
+		return
+	}
 	if a.profile == nil {
 		a.showMain()
 		a.openLogin()
