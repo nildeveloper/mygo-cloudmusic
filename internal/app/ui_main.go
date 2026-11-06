@@ -17,16 +17,20 @@ func (a *app) view(c *ui.Context) {
 	a.pal = paletteFor(&t)
 	p := a.pal
 	t.Accent, t.AccentText = p.accent, p.onAccent
+	t.AccentHover = p.accent.Mix(p.onAccent, 0.12)
+	t.AccentPressed = p.accent.Mix(ui.RGB(0, 0, 0), 0.12)
+	t.Focus = p.accent.Alpha(0.5)
 	t.Selection = p.accent.Alpha(0.3)
 	c.SetTheme(&t)
 
+	a.updatePlaybackError()
 	a.shortcuts(c)
 
 	if c.Vibrancy() {
 		c.Root().Background(ui.Transparent)
 	}
 	root := ui.Box(c).Fill()
-	if !c.Focused(a.searchBox) && !a.together.open {
+	if !c.Focused(a.searchBox) && !a.together.open && !a.playbackError.open {
 		// Space plays and pauses wherever the focus is, as in Music. On
 		// the container around everything, it comes before a button the
 		// pointer focused, which would take Space as a click; on the
@@ -87,7 +91,9 @@ func (a *app) shortcuts(c *ui.Context) {
 		a.searchBox.Focus(c)
 	})
 	if a.nowPlaying {
-		c.OnShortcut(0, ui.KeyEscape, func() { a.nowPlaying = false })
+		if !a.playbackError.open {
+			c.OnShortcut(0, ui.KeyEscape, func() { a.nowPlaying = false })
+		}
 		// ⌘ and a number choose Now Playing's tab of that place.
 		if a.pl.Current() != nil {
 			for i, t := range a.npTabs() {

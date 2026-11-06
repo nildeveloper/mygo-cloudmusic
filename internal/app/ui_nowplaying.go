@@ -158,7 +158,7 @@ func (a *app) nowPlayingBody(c *ui.Context, tr *netease.Track, art *artwork, acc
 		if a.together.session != nil {
 			presenceHeight := float32(82)
 			if h < 700 {
-				presenceHeight = 44
+				presenceHeight = 64
 			}
 			coverSize = min(side, h-436-presenceHeight)
 		}
@@ -196,7 +196,11 @@ func (a *app) nowPlayingBody(c *ui.Context, tr *netease.Track, art *artwork, acc
 				ui.Row(c).Height(16).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, clock(pl.Position())).FontSize(11).FontFeatures("tnum").TextColor(white.Alpha(0.5))
 					ui.Spacer(c)
-					qualityBadge(c, pl.Stream())
+					if pl.Err() != "" {
+						a.playbackErrorButton(c, white)
+					} else {
+						qualityBadge(c, pl.Stream())
+					}
 					ui.Spacer(c)
 					status := "-" + clock(pl.Duration()-pl.Position())
 					if pl.Loading() {
@@ -395,7 +399,11 @@ func (a *app) stageBar(c *ui.Context, tr *netease.Track, art *artwork, accent ui
 			})
 			a.transport(c, white, white.Alpha(0.45), white, 22)
 			ui.Row(c).Grow(1).Basis(0).MinWidth(0).Justify(ui.End).Children(func() {
-				ui.Text(c, clock(pl.Position())+" / "+clock(pl.Duration())).FontSize(11.5).FontFeatures("tnum").TextColor(white.Alpha(0.5))
+				if pl.Err() != "" {
+					a.playbackErrorButton(c, white)
+				} else {
+					ui.Text(c, clock(pl.Position())+" / "+clock(pl.Duration())).FontSize(11.5).FontFeatures("tnum").TextColor(white.Alpha(0.5))
+				}
 			})
 		})
 	})

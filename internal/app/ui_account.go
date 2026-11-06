@@ -46,6 +46,7 @@ func (a *app) boot() {
 
 // signedIn shows what is personal to prof, or to nobody.
 func (a *app) signedIn(prof *netease.Profile) {
+	a.clearTogetherReport()
 	if a.profile != nil && (prof == nil || prof.UserID != a.profile.UserID) {
 		a.stopTogether()
 	}

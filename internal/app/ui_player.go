@@ -375,6 +375,9 @@ func (a *app) playerBar(c *ui.Context) {
 				return
 			}
 			info := ui.ButtonBase(c.Key("info")).Gap(12).AlignItems(ui.Center).FocusRing(false).Shrink(1).MinWidth(0).Label("打开正在播放")
+			if pl.Err() != "" {
+				info.Label("查看播放异常")
+			}
 			hovered := info.Hovered()
 			info.Children(func() {
 				ui.Box(c).Size(48, 48).Shrink(0).Children(func() {
@@ -397,7 +400,7 @@ func (a *app) playerBar(c *ui.Context) {
 					case pl.Loading():
 						sub = "正在缓冲…"
 					case pl.Err() != "":
-						sub, color = pl.Err(), p.accent
+						sub, color = "播放异常 · 点击查看", p.accent
 					}
 					if sub == "" {
 						a.artistLinks(c, tr, p.muted, p.text).FontSize(12).SingleLine()
@@ -407,7 +410,14 @@ func (a *app) playerBar(c *ui.Context) {
 				})
 			})
 			if info.Clicked() {
-				a.nowPlaying = true
+				if pl.Err() != "" {
+					a.playbackError.open = !a.playbackError.open
+				} else {
+					a.nowPlaying = true
+				}
+			}
+			if pl.Err() != "" && !a.nowPlaying {
+				a.playbackErrorDetails(c, info)
 			}
 			a.likeButton(c.Key("like"), tr, 16, p.muted).Margin(0, 0, 0, 4).Shrink(0)
 		})

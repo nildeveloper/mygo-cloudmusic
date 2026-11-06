@@ -22,14 +22,27 @@ func (id *ListenID) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+type ListenUser struct {
+	UserID    ListenID `json:"userId"`
+	Nickname  string   `json:"nickname"`
+	AvatarURL string   `json:"avatarUrl"`
+}
 type ListenRoom struct {
-	RoomID    string   `json:"roomId"`
-	CreatorID ListenID `json:"creatorId"`
-	Users     []struct {
-		UserID    ListenID `json:"userId"`
-		Nickname  string   `json:"nickname"`
-		AvatarURL string   `json:"avatarUrl"`
-	} `json:"roomUsers"`
+	RoomID    string       `json:"roomId"`
+	CreatorID ListenID     `json:"creatorId"`
+	Users     []ListenUser `json:"roomUsers"`
+}
+
+// Report durations are seconds, unlike playback positions in milliseconds.
+// Optional counters stay absent rather than becoming invented zeroes.
+type ListenReport struct {
+	RoomID         string     `json:"roomId"`
+	User           ListenUser `json:"userInfo"`
+	Peer           ListenUser `json:"anotherUserInfo"`
+	Duration       *int64     `json:"duration"`
+	SongCount      *int64     `json:"songCount"`
+	TotalDuration  *int64     `json:"totalDuration"`
+	TotalSongCount *int64     `json:"totalSongCount"`
 }
 type ListenStatus struct {
 	InRoom   bool        `json:"inRoom"`
@@ -67,12 +80,6 @@ type ListenHeartbeat struct {
 	Time     int64 `json:"time"`
 	TimeSpan int   `json:"timeSpan"`
 }
-type ListenError struct {
-	Code    int
-	Message string
-}
-
-func (e *ListenError) Error() string { return fmt.Sprintf("一起听：%s（%d）", e.Message, e.Code) }
 
 // ListenClient binds every request, including cleanup, to the login that
 // opened the room. It neither reads a new login nor changes the shared jar.
@@ -97,7 +104,7 @@ func (c *ListenClient) call(ctx context.Context, path string, data map[string]an
 		if msg == "" {
 			msg = "请求失败"
 		}
-		return &ListenError{r.Code, msg}
+		return &ResponseError{r.Code, msg}
 	}
 	if out == nil {
 		return nil
@@ -207,6 +214,24 @@ func (c *ListenClient) Queue(ctx context.Context, room string, uid, version int6
 func (c *ListenClient) End(ctx context.Context, room string) error {
 	return c.ack(ctx, "end/v2", map[string]any{"roomId": room})
 }
+
+// Report reads the same per-room summary used by NetEase's ending page.
+func (c *ListenClient) Report(ctx context.Context, room string) (ListenReport, error) {
+	var r ListenReport
+	if room == "" {
+		return r, fmt.Errorf("一起听：报告缺少房间")
+	}
+	if err := c.call(ctx, "record/get", map[string]any{"roomId": room}, &r); err != nil {
+		return r, err
+	}
+	if r.RoomID != "" && r.RoomID != room {
+		return r, fmt.Errorf("一起听：报告房间不匹配")
+	}
+	if r.Duration == nil || *r.Duration < 0 || r.SongCount == nil || *r.SongCount < 0 || r.User.UserID <= 0 || r.Peer.UserID <= 0 {
+		return r, fmt.Errorf("一起听：报告尚未生成")
+	}
+	return r, nil
+}
 func (c *ListenClient) Tracks(ctx context.Context, ids []int64) ([]Track, error) {
 	var out []Track
 	for len(ids) > 0 {
@@ -226,7 +251,7 @@ func (c *ListenClient) Tracks(ctx context.Context, ids []int64) ([]Track, error)
 			return nil, err
 		}
 		if r.Code != 200 {
-			return nil, &ListenError{r.Code, "无法加载房间歌曲"}
+			return nil, &ResponseError{r.Code, "无法加载房间歌曲"}
 		}
 		withPrivileges(r.Songs, r.Privileges)
 		out = append(out, r.Songs...)

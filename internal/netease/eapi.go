@@ -30,15 +30,32 @@ import (
 const (
 	eapiDomain = "https://interfacepc.music.163.com"
 	eapiKey    = "e82ckenh8dichen8"
-	eapiUA     = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)"
 )
 
-// The desktop client this app speaks as.
-var eapiClient = map[string]string{
-	"os":      "pc",
-	"appver":  "3.1.17.204416",
-	"osver":   "Microsoft-Windows-10-Professional-build-19045-64bit",
-	"channel": "netease",
+// Keep the protocol identity stable across host platforms. A target selects
+// the whole profile so its Cookie, encrypted header and UA cannot mix clients.
+type eapiProfile struct{ appver, osver, userAgent string }
+
+func eapiClient(os string) (eapiProfile, error) {
+	switch os {
+	case "pc":
+		const version = "3.1.17.204416"
+		return eapiProfile{
+			appver: version,
+			osver:  "Microsoft-Windows-10-Professional-build-19045-64bit",
+			userAgent: "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 " +
+				"(KHTML, like Gecko) Safari/537.36 Chrome/91.0.4472.164 NeteaseMusicDesktop/" + version,
+		}, nil
+	case "osx":
+		return eapiProfile{
+			appver: "3.1.10.5100",
+			osver:  "15.5",
+			userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+				"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+		}, nil
+	default:
+		return eapiProfile{}, fmt.Errorf("netease: unsupported EAPI client %q", os)
+	}
 }
 
 var (
@@ -88,19 +105,41 @@ func eapiRequest(ctx context.Context, path string, data map[string]any, out any,
 	return eapiRequestAt(ctx, path, data, out, cookies, saveCookies, eapiTarget{domain: eapiDomain})
 }
 
-type eapiTarget struct{ domain, os string }
+type eapiTarget struct {
+	domain, os string
+	status     *int // optional response metadata for audio diagnostics
+}
+
+// ResponseError preserves the service code for callers that handle expiry or
+// authentication failures. HTTP validation is independent of Cookie policy.
+type ResponseError struct {
+	Code    int
+	Message string
+}
+
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("netease: %s（%d）", e.Message, e.Code)
+}
 
 func eapiRequestAt(ctx context.Context, path string, data map[string]any, out any, cookies []*http.Cookie, saveCookies bool, target eapiTarget) error {
+	clientOS := target.os
+	if clientOS == "" {
+		clientOS = "pc"
+	}
+	client, err := eapiClient(clientOS)
+	if err != nil {
+		return err
+	}
 	header := map[string]string{
-		"osver":       eapiClient["osver"],
+		"osver":       client.osver,
 		"deviceId":    device(),
-		"os":          eapiClient["os"],
-		"appver":      eapiClient["appver"],
+		"os":          clientOS,
+		"appver":      client.appver,
 		"versioncode": "140",
 		"mobilename":  "",
 		"buildver":    fmt.Sprint(time.Now().Unix()),
 		"resolution":  "1920x1080",
-		"channel":     eapiClient["channel"],
+		"channel":     "netease",
 		"requestId":   fmt.Sprintf("%d_%04d", time.Now().UnixMilli(), time.Now().Nanosecond()%1000),
 		"__csrf":      "",
 	}
@@ -111,9 +150,6 @@ func eapiRequestAt(ctx context.Context, path string, data map[string]any, out an
 		case "__csrf":
 			header["__csrf"] = c.Value
 		}
-	}
-	if target.os != "" {
-		header["os"] = target.os
 	}
 	data["header"] = header
 	data["e_r"] = false
@@ -131,7 +167,7 @@ func eapiRequestAt(ctx context.Context, path string, data map[string]any, out an
 		cookie = append(cookie, url.QueryEscape(k)+"="+url.QueryEscape(v))
 	}
 	req.Header.Set("Cookie", strings.Join(cookie, "; "))
-	req.Header.Set("User-Agent", eapiUA)
+	req.Header.Set("User-Agent", client.userAgent)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	// Sent by hand: the jar would add the site's cookies to these.
 	res, err := (&http.Client{Timeout: httpClient.Timeout}).Do(req)
@@ -139,6 +175,9 @@ func eapiRequestAt(ctx context.Context, path string, data map[string]any, out an
 		return err
 	}
 	defer res.Body.Close()
+	if target.status != nil {
+		*target.status = res.StatusCode
+	}
 	// Keep what it sets for the site, whichever host set it.
 	if set := res.Cookies(); saveCookies && ctx.Err() == nil && len(set) > 0 {
 		for _, c := range set {
@@ -151,7 +190,7 @@ func eapiRequestAt(ctx context.Context, path string, data map[string]any, out an
 	if err != nil {
 		return err
 	}
-	if !saveCookies && (res.StatusCode < 200 || res.StatusCode >= 300) {
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		var api apiError
 		_ = json.Unmarshal(body, &api)
 		code := res.StatusCode
@@ -165,10 +204,7 @@ func eapiRequestAt(ctx context.Context, path string, data map[string]any, out an
 		if message == "" {
 			message = http.StatusText(res.StatusCode)
 		}
-		if target.domain != eapiDomain {
-			return fmt.Errorf("netease: %s: code %d %s", path, code, message)
-		}
-		return &ListenError{Code: code, Message: message}
+		return &ResponseError{Code: code, Message: message}
 	}
 	return json.Unmarshal(body, out)
 }

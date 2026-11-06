@@ -10,9 +10,16 @@ const (
 	RecordWeek RecordPeriod = 1
 )
 
+// SongRecord keeps the server's optional count separate from song metadata.
+// A missing count is unknown, and score is never used as a count.
+type SongRecord struct {
+	Track
+	PlayCount *int64
+}
+
 // ListeningRecord returns songs in the server's ranking order. Scores are
 // relative weights, not play counts; this read does not report local plays.
-func ListeningRecord(uid int64, period RecordPeriod) ([]Track, error) {
+func ListeningRecord(uid int64, period RecordPeriod) ([]SongRecord, error) {
 	if uid <= 0 || period != RecordWeek && period != RecordAll {
 		return nil, fmt.Errorf("netease: invalid listening record request")
 	}
@@ -25,7 +32,8 @@ func ListeningRecord(uid int64, period RecordPeriod) ([]Track, error) {
 		Duration int64    `json:"duration"`
 	}
 	type entry struct {
-		Song song `json:"song"`
+		Song      song   `json:"song"`
+		PlayCount *int64 `json:"playCount"`
 	}
 	var res struct {
 		apiError
@@ -43,6 +51,7 @@ func ListeningRecord(uid int64, period RecordPeriod) ([]Track, error) {
 		rows = res.All
 	}
 	tracks := make([]Track, 0, len(rows))
+	records := make([]SongRecord, 0, len(rows))
 	for _, row := range rows {
 		t := row.Song.Track
 		if t.ID <= 0 {
@@ -58,7 +67,11 @@ func ListeningRecord(uid int64, period RecordPeriod) ([]Track, error) {
 			t.Duration = row.Song.Duration
 		}
 		tracks = append(tracks, t)
+		records = append(records, SongRecord{PlayCount: row.PlayCount})
 	}
 	detailPrivileges(tracks)
-	return tracks, nil
+	for i := range tracks {
+		records[i].Track = tracks[i]
+	}
+	return records, nil
 }

@@ -2,12 +2,8 @@
   "name": "MyGo 云音乐",
   "identifier": "dev.egoist.cloudmusic",
   "slug": "mygo-cloudmusic",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "out": "build",
-  "updates": {
-    "publicKey": "WzJsOGNIuf6mcEqo5ff8jub+NoQQOEk4JXreLPYjgyQ=",
-    "github": "egoist/mygo-cloudmusic"
-  },
   "macos": {
     "icon": "icon/AppIcon.icon",
     "minimumSystemVersion": "13.0",

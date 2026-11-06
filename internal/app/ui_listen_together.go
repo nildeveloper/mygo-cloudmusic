@@ -1,6 +1,9 @@
 package app
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/egoist/mygo/ui"
 	"rsc.io/qr"
 
@@ -19,7 +22,7 @@ func (a *app) togetherStatus() string {
 		return "正在离开一起听…"
 	case s.State.Reconnecting:
 		return "正在恢复同步…"
-	case len(s.State.Room.Users) < 2:
+	case a.togetherPeer() == nil:
 		return "等待好友加入…"
 	default:
 		return "正在一起听"
@@ -31,13 +34,12 @@ func (a *app) togetherFaces(c *ui.Context, color ui.Color, size float32) {
 	if a.profile != nil {
 		ownURL, ownName = a.profile.AvatarURL, a.profile.Nickname
 	}
-	if s := a.together.session; s != nil {
-		for _, u := range s.State.Room.Users {
-			if a.profile == nil || int64(u.UserID) != a.profile.UserID {
-				peerURL, peerName = u.AvatarURL, u.Nickname
-				break
-			}
-		}
+	if peer := a.togetherPeer(); peer != nil {
+		peerURL, peerName = peer.AvatarURL, peer.Nickname
+	}
+	if r := a.together.report; r != nil && r.data != nil {
+		ownURL, ownName = r.data.User.AvatarURL, r.data.User.Nickname
+		peerURL, peerName = r.data.Peer.AvatarURL, r.data.Peer.Nickname
 	}
 	avatar := func(key, url, name string) {
 		ui.Box(c.Key(key)).Size(size, size).Radius(size / 2).Background(color.Alpha(0.08)).Center().Tooltip(name).Children(func() {
@@ -64,18 +66,15 @@ func (a *app) togetherPresence(c *ui.Context, compact bool) {
 	}
 	b := ui.ButtonBase(c.Key("together-presence")).Height(82).WidthPercent(100).Radius(14).
 		Label("一起听房间").Center().TextColor(white).Menu(a.togetherMenu)
+	size := float32(40)
 	if compact {
-		b.Height(44).Children(func() {
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-				a.togetherFaces(c, white, 24)
-				ui.Text(c, a.togetherStatus()).FontSize(12).TextColor(white.Alpha(0.6)).SingleLine()
-			})
-		})
-		return
+		b.Height(64)
+		size = 24
 	}
+
 	b.Children(func() {
 		ui.Column(c).AlignItems(ui.Center).Gap(8).Children(func() {
-			a.togetherFaces(c, white, 40)
+			a.togetherFaces(c, white, size)
 			ui.Text(c, a.togetherStatus()).FontSize(12).TextColor(white.Alpha(0.6)).SingleLine()
 		})
 	})
@@ -84,6 +83,9 @@ func (a *app) togetherPresence(c *ui.Context, compact bool) {
 func (a *app) togetherInvitation() string {
 	s, song := a.together.session, a.pl.Current()
 	if s == nil || song == nil || a.profile == nil || s.State.Room.RoomID == "" {
+		return ""
+	}
+	if s.State.Connecting || s.State.Leaving || a.togetherPeer() != nil {
 		return ""
 	}
 	return (listentogether.Invitation{Room: s.State.Room.RoomID, Inviter: a.profile.UserID}).URL(song.ID)
@@ -101,15 +103,24 @@ func (a *app) showTogetherInvitation() {
 	}
 	a.together.shareLink, a.together.shareCode = link, code
 	a.together.open = true
+	a.together.session.WatchMembers(true)
+}
+
+func (a *app) dismissTogetherInvitation() {
+	if s := a.together.session; s != nil {
+		s.WatchMembers(false)
+	}
+	a.together.open, a.together.shareOnJoin = false, false
+	a.together.shareCode, a.together.shareLink = nil, ""
 }
 
 func (a *app) copyTogetherInvitation() {
 	link := a.togetherInvitation()
-	if a.together.open && a.together.shareCode != nil {
-		link = a.together.shareLink // Copy exactly the invitation shown in the QR.
-	}
 	if link == "" {
 		return
+	}
+	if a.together.open && a.together.shareCode != nil {
+		link = a.together.shareLink // Copy exactly the invitation shown in the QR.
 	}
 	if err := copyText(link); err != nil {
 		a.toast = "复制失败"
@@ -118,12 +129,12 @@ func (a *app) copyTogetherInvitation() {
 	}
 }
 
-// Background polling never changes whether these user actions are available.
+// Polling activity alone never disables these user actions.
 func (a *app) togetherMenu(m *ui.Menu) {
 	s := a.together.session
 	if s == nil {
 		if m.Item("一起听…").Chosen() {
-			a.together.open = true
+			a.openTogether()
 		}
 		return
 	}
@@ -138,10 +149,20 @@ func (a *app) togetherMenu(m *ui.Menu) {
 		}
 		return
 	}
-	if m.Item("邀请好友…").Disabled(s.State.Leaving || a.togetherInvitation() == "").Chosen() {
+	if a.pl.Err() != "" {
+		if m.Item("重试本机播放").Disabled(!a.canRetryPlayback()).Chosen() {
+			a.retryPlayback()
+		}
+		if m.Item("复制播放诊断").Chosen() {
+			a.copyPlaybackDiagnostic()
+		}
+		m.Separator()
+	}
+	canInvite := a.togetherInvitation() != ""
+	if m.Item("邀请好友…").Disabled(!canInvite).Chosen() {
 		a.showTogetherInvitation()
 	}
-	if m.Item("复制一起听邀请").Disabled(s.State.Leaving || s.State.Room.RoomID == "" || a.pl.Current() == nil).Chosen() {
+	if m.Item("复制一起听邀请").Disabled(!canInvite).Chosen() {
 		a.copyTogetherInvitation()
 	}
 	if m.Item("重新同步").Disabled(s.State.Leaving || s.State.Syncing).Chosen() {
@@ -152,41 +173,62 @@ func (a *app) togetherMenu(m *ui.Menu) {
 	}
 }
 
+// Both room setup and the ending report share one modal frame.
+func (a *app) togetherModal(c *ui.Context, key string, body func()) {
+	p := a.pal
+	width, _ := c.Size()
+	ui.DialogBase(c.Key(key), &a.together.open, func(backdrop, panel ui.Element) {
+		backdrop.Background(ui.RGBA(0, 0, 0, 0.35))
+		panel.Width(min(400, width-40)).Padding(28).Radius(24).Gap(20).
+			Background(p.bg).Border(1, p.hairline).TextColor(p.text).Shadow(0, 24, 60, -12, p.cardShade)
+		body()
+	})
+}
+
 func (a *app) togetherDialog(c *ui.Context) {
 	t, p := &a.together, a.pal
+	if r := t.report; r != nil && r.data != nil {
+		a.togetherReportDialog(c)
+		return
+	}
 	_, height := c.Size()
-	ui.DialogBase(c.Key("together-dialog"), &t.open, func(backdrop, panel ui.Element) {
-		backdrop.Background(ui.RGBA(0, 0, 0, 0.35))
-		panel.Width(420).Padding(24).Radius(20).Gap(20).Background(p.bg).Border(1, p.hairline).TextColor(p.text)
-		ui.Row(c).AlignItems(ui.Center).Children(func() {
+	wasOpen := t.open
+	a.togetherModal(c, "together-dialog", func() {
+		ui.Row(c).AlignItems(ui.Center).Gap(4).Children(func() {
 			title := "一起听"
 			if t.session != nil && t.shareCode != nil {
-				title = "邀请好友一起听"
+				title = "邀请好友"
+			} else if t.session == nil && t.joining {
+				title = "加入好友"
+				if iconButton(c.Key("back"), iconBack, 15, p.muted, "返回一起听").Clicked() {
+					t.joining, t.err = false, ""
+				}
 			}
-			ui.Text(c, title).FontSize(20).FontWeight(700).Grow(1)
+			ui.Text(c, title).FontSize(14).FontWeight(600).TextColor(p.muted).Grow(1)
 			if iconButton(c.Key("close"), iconX, 16, p.muted, "关闭面板").Clicked() {
 				t.open = false
 			}
 		})
-		ui.Column(c).AlignItems(ui.Center).Gap(12).PaddingY(8).Children(func() {
-			a.togetherFaces(c, p.text, 52)
-			ui.Text(c, a.togetherStatus()).FontSize(13).TextColor(p.muted)
-		})
 		if s := t.session; s != nil {
 			if code := t.shareCode; code != nil {
-				ui.Column(c).AlignItems(ui.Center).Gap(12).Children(func() {
-					size := min(float32(224), max(160, height-410))
-					ui.Box(c.Key("invitation-qr")).Size(size, size).Radius(12).Background(white).
+				ui.Column(c).AlignItems(ui.Center).Gap(16).Children(func() {
+					ui.Text(c, "打开网易云，扫码加入").FontSize(14).TextColor(p.muted)
+					size := min(float32(224), max(160, height-310))
+					ui.Box(c.Key("invitation-qr")).Size(size, size).Radius(16).Background(white).Border(1, p.hairline).
 						Label("一起听邀请二维码").Draw(func(pt *ui.Painter, r ui.Rect) { drawQR(pt, r, code, 18) })
-					ui.Text(c, "扫码打开邀请，或复制链接发给好友").FontSize(12).TextColor(p.muted)
+					a.togetherFaces(c, p.text, 32)
+					ui.Text(c, "好友加入后，这里会自动收起").FontSize(12).TextColor(p.muted)
 				})
-				if ui.PrimaryButton(c.Key("copy-invitation"), "复制邀请链接").Clicked() {
+				if pillButton(c.Key("copy-invitation"), nil, "复制邀请链接", p.accent, p.onAccent).
+					Height(44).Radius(12).Justify(ui.Center).Clicked() {
 					a.copyTogetherInvitation()
 				}
 				return
 			}
-			// Normally the room lives in the cover and its menu; this also
-			// handles a panel that was already open when the room changed.
+			ui.Column(c).AlignItems(ui.Center).Gap(12).Children(func() {
+				a.togetherFaces(c, p.text, 44)
+				ui.Text(c, a.togetherStatus()).FontSize(13).TextColor(p.muted)
+			})
 			if s.State.Error != "" {
 				ui.Text(c, s.State.Error).FontSize(13).TextColor(p.muted)
 			}
@@ -194,36 +236,130 @@ func (a *app) togetherDialog(c *ui.Context) {
 			b.Menu(a.togetherMenu)
 			return
 		}
-		if a.profile == nil {
-			if ui.PrimaryButton(c.Key("login"), "登录网易云").Clicked() {
-				t.open = false
-				a.openLogin()
-			}
-			return
-		}
-		ui.Column(c).Gap(10).Children(func() {
-			ui.TextInput(c.Key("invitation"), &t.invite).Label("一起听邀请链接").Placeholder("粘贴好友的网易云一起听邀请").FontSize(13)
-			if ui.PrimaryButton(c.Key("join"), "加入邀请").Disabled(t.invite == "").Clicked() {
-				a.startTogether("join")
-			}
-		})
-		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Box(c).Grow(1).Height(1).Background(p.hairline)
-			ui.Text(c, "或").FontSize(12).TextColor(p.faint)
-			ui.Box(c).Grow(1).Height(1).Background(p.hairline)
-		})
-		if ui.Button(c.Key("create"), "发起一起听，邀请好友").Clicked() {
-			a.startTogether("create")
-		}
-		ui.Row(c).Justify(ui.Center).Children(func() {
-			b := ui.ButtonBase(c.Key("resume")).Padding(6, 10).Radius(8).TextColor(p.muted).Label("恢复当前房间")
-			b.Children(func() { ui.Text(c, "恢复当前房间").FontSize(12) })
-			if b.Clicked() {
-				a.startTogether("resume")
-			}
-		})
+		a.togetherSetup(c)
 		if t.err != "" {
 			ui.Text(c, t.err).FontSize(13).TextColor(p.accent)
 		}
 	})
+	if wasOpen && !t.open && t.shareCode != nil {
+		a.dismissTogetherInvitation()
+	}
+}
+
+func (a *app) togetherSetup(c *ui.Context) {
+	t, p := &a.together, a.pal
+	title, subtitle := "好音乐，一起听", "邀请一位好友，同步播放与切歌"
+	if t.joining {
+		title, subtitle = "加入好友的一起听", "粘贴好友发来的网易云邀请链接"
+	}
+	ui.Column(c).Gap(8).Children(func() {
+		ui.Text(c, title).FontSize(24).FontWeight(700)
+		ui.Text(c, subtitle).FontSize(13).TextColor(p.muted)
+	})
+	if t.joining {
+		in := ui.TextInputBase(c.Key("invitation"), &t.invite).Label("一起听邀请链接").Placeholder("粘贴邀请链接").
+			Height(44).PaddingX(14).Radius(12).Background(p.hover).Border(1, p.hairline).FontSize(13).AutoFocus()
+		if in.Focused() {
+			in.BorderColor(p.accent)
+		}
+		join := pillButton(c.Key("join"), nil, "加入一起听", p.accent, p.onAccent).
+			Height(44).Radius(12).Justify(ui.Center).Disabled(strings.TrimSpace(t.invite) == "")
+		if (join.Clicked() || in.Submitted()) && strings.TrimSpace(t.invite) != "" {
+			a.startTogether("join")
+		}
+		return
+	}
+	track := a.pl.Current()
+	canCreate := track != nil && track.ProgramID == 0 && a.pl.Radio() == ""
+	ui.Row(c).Padding(12).Gap(12).Radius(14).Background(p.hover).AlignItems(ui.Center).Children(func() {
+		if canCreate {
+			a.cover(c, track.Album.PicURL, 120, 48, 9)
+			ui.Column(c).Grow(1).MinWidth(0).Gap(5).Children(func() {
+				ui.Text(c, track.Name).FontSize(14).FontWeight(600).SingleLine()
+				ui.Text(c, track.ArtistNames()).FontSize(12).TextColor(p.muted).SingleLine()
+			})
+		} else {
+			ui.Icon(c, iconHeadset).Size(24, 24).TextColor(p.muted)
+			ui.Text(c, "先选一首普通歌曲，即可发起邀请").FontSize(12).TextColor(p.muted)
+		}
+	})
+	if a.profile == nil {
+		if pillButton(c.Key("login"), nil, "登录网易云", p.accent, p.onAccent).Height(44).Radius(12).Justify(ui.Center).Clicked() {
+			t.open = false
+			a.openLogin()
+		}
+		return
+	}
+	if pillButton(c.Key("create"), iconHeadset, "发起一起听", p.accent, p.onAccent).
+		Height(44).Radius(12).Justify(ui.Center).Disabled(!canCreate).Clicked() {
+		a.startTogether("create")
+	}
+	ui.Row(c).Justify(ui.Center).Gap(12).Children(func() {
+		if pillButton(c.Key("join-mode"), nil, "加入好友", ui.Transparent, p.muted).Height(32).Radius(10).Clicked() {
+			t.joining, t.err = true, ""
+		}
+		ui.Box(c).Width(1).Height(12).Background(p.hairline).AlignSelf(ui.Center)
+		if pillButton(c.Key("resume"), nil, "恢复当前房间", ui.Transparent, p.muted).Height(32).Radius(10).Clicked() {
+			a.startTogether("resume")
+		}
+	})
+}
+
+func (a *app) togetherReportDialog(c *ui.Context) {
+	t, p := &a.together, a.pal
+	r := t.report.data
+	a.togetherModal(c, "together-report", func() {
+		ui.Row(c).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "一起听已结束").FontSize(14).FontWeight(600).TextColor(p.muted).Grow(1)
+			if iconButton(c.Key("close"), iconX, 16, p.muted, "关闭总结").Clicked() {
+				t.open = false
+			}
+		})
+		ui.Column(c).AlignItems(ui.Center).Gap(10).Children(func() {
+			a.togetherFaces(c, p.text, 48)
+			name, peer := r.User.Nickname, r.Peer.Nickname
+			if name == "" {
+				name = "我"
+			}
+			if peer == "" {
+				peer = "好友"
+			}
+			ui.Text(c, name+" · "+peer).WidthPercent(100).SingleLine().TextAlign(ui.Center).FontSize(13).TextColor(p.muted)
+		})
+		ui.Column(c).PaddingY(20).Radius(16).Background(p.hover).AlignItems(ui.Center).Gap(8).Children(func() {
+			ui.Text(c, "本次陪伴").FontSize(12).TextColor(p.muted)
+			ui.Text(c, togetherDuration(*r.Duration)).FontSize(32).FontWeight(700).FontFeatures("tnum").TextAlign(ui.Center)
+			ui.Text(c, fmt.Sprintf("一起听过 %d 首歌", *r.SongCount)).FontSize(13).TextColor(p.muted)
+		})
+		var total []string
+		if r.TotalDuration != nil && *r.TotalDuration >= 0 {
+			total = append(total, "累计陪伴 "+togetherDuration(*r.TotalDuration))
+		}
+		if r.TotalSongCount != nil && *r.TotalSongCount >= 0 {
+			total = append(total, fmt.Sprintf("听过 %d 首", *r.TotalSongCount))
+		}
+		if len(total) > 0 {
+			ui.Text(c, strings.Join(total, " · ")).FontSize(12).TextColor(p.muted).TextAlign(ui.Center)
+		}
+		if pillButton(c.Key("done"), nil, "完成", p.accent, p.onAccent).Height(44).Radius(12).Justify(ui.Center).Clicked() {
+			t.open = false
+		}
+	})
+	if !t.open {
+		a.clearTogetherReport()
+	}
+}
+
+func togetherDuration(seconds int64) string {
+	if seconds < 60 {
+		return fmt.Sprintf("%d 秒", seconds)
+	}
+	if seconds < 3600 {
+		return fmt.Sprintf("%d 分钟", seconds/60)
+	}
+	hours, minutes := seconds/3600, seconds/60%60
+	if minutes == 0 {
+		return fmt.Sprintf("%d 小时", hours)
+	}
+	return fmt.Sprintf("%d 小时 %d 分", hours, minutes)
 }

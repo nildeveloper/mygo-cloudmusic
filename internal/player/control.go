@@ -22,6 +22,7 @@ func (p *Player) dispatch(c Command) bool { return p.Control != nil && p.Control
 // Playback is a deterministic target from an external controller. Applying it
 // never emits another command, including when its audio finishes loading.
 type Playback struct {
+	Instance uint64 // nonzero external playback identity; unchanged during seeks
 	Queue    []netease.Track
 	Order    []int
 	Index    int
@@ -60,27 +61,23 @@ func (p *Player) Apply(s Playback) {
 		p.repeat = RepeatOne
 	}
 	pos := min(max(0, s.Position), max(0, s.Queue[s.Index].Length()-time.Millisecond))
-	if !same {
-		p.loadSkipping(at, 0, s.Playing, pos)
+	if !same || !p.loading && p.out == nil {
+		// A new target can retry a failed decoder; unchanged polls never Apply.
+		p.loadTrack(at, s.Playing, pos)
+		p.instance = s.Instance
 		p.pendingAt = time.Now()
 		return
 	}
 	if p.loading {
+		p.instance = s.Instance
 		p.pending = pos
 		p.pendingAt = time.Now()
 		p.playing = s.Playing
 		p.sync()
 		return
 	}
-	if p.out == nil {
-		// A new command or explicit resync can retry a failed decoder; an
-		// unchanged poll never calls Apply in the first place.
-		p.loadSkipping(at, 0, s.Playing, pos)
-		p.pendingAt = time.Now()
-		return
-	}
-	p.setPlaying(s.Playing)
-	p.seek(pos)
+	p.playing = s.Playing
+	p.seek(pos, s.Instance)
 }
 
 // Clear also invalidates already queued decoder/seek callbacks.
@@ -97,6 +94,7 @@ func (p *Player) Clear() {
 	p.lyrics = nil
 	p.lyricsLoaded = false
 	p.err = ""
+	p.errDetails = ""
 	p.sync()
 }
 

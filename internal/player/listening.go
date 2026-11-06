@@ -57,11 +57,3 @@ func (p *Player) PollListening() { p.observeListening(false) }
 
 // FinishListening settles the current instance on EOF, replacement or shutdown.
 func (p *Player) FinishListening() { p.observeListening(true) }
-
-// Every output seek marks a discontinuity. Never credit the skipped interval,
-// including a remote synchronization seek or a restored session's position.
-func (p *Player) seekOutput(to time.Duration) {
-	p.PollListening()
-	p.out.Seek(to)
-	p.listening.position, p.listening.at = p.out.Position(), time.Now()
-}

@@ -19,6 +19,7 @@ const (
 )
 
 type recordData struct {
+	ranks    []netease.SongRecord
 	tracks   []netease.Track
 	plays    []netease.Play // same row order as tracks; recent plays only
 	loading  bool
@@ -49,6 +50,7 @@ func (a *app) loadRecords(tab recordTab, refresh bool) {
 	go func() {
 		var tracks []netease.Track
 		var plays []netease.Play
+		var ranks []netease.SongRecord
 		var err error
 		if tab == recordRecent {
 			plays, err = recentPlays(100)
@@ -61,13 +63,17 @@ func (a *app) loadRecords(tab recordTab, refresh bool) {
 			if tab == recordAll {
 				period = netease.RecordAll
 			}
-			tracks, err = listeningRecord(uid, period)
+			ranks, err = listeningRecord(uid, period)
+			tracks = make([]netease.Track, len(ranks))
+			for i := range ranks {
+				tracks[i] = ranks[i].Track
+			}
 		}
-		a.post(func() { a.finishRecords(uid, tab, d, tracks, plays, err) })
+		a.post(func() { a.finishRecords(uid, tab, d, tracks, plays, ranks, err) })
 	}()
 }
 
-func (a *app) finishRecords(uid int64, tab recordTab, d *recordData, tracks []netease.Track, plays []netease.Play, err error) {
+func (a *app) finishRecords(uid int64, tab recordTab, d *recordData, tracks []netease.Track, plays []netease.Play, ranks []netease.SongRecord, err error) {
 	// Object identity also rejects an earlier login of the same account.
 	if a.profile == nil || a.profile.UserID != uid || a.records.data[tab] != d {
 		return
@@ -77,7 +83,7 @@ func (a *app) finishRecords(uid int64, tab recordTab, d *recordData, tracks []ne
 		d.err = "加载失败，请检查网络、登录状态或账号的隐私设置后重试"
 		return // Keep an already displayed list on refresh failure.
 	}
-	d.tracks, d.plays, d.loadedAt, d.err = tracks, plays, time.Now(), ""
+	d.tracks, d.plays, d.ranks, d.loadedAt, d.err = tracks, plays, ranks, time.Now(), ""
 }
 
 func (a *app) recordsPage(c *ui.Context) {
@@ -127,6 +133,15 @@ func (a *app) recordsPage(c *ui.Context) {
 			}
 			ui.Text(c, label).Width(104).TextAlign(ui.End).FontSize(12).FontFeatures("tnum").TextColor(a.pal.muted).
 				Tooltip(detail)
+		}
+	} else {
+		meta = func(c *ui.Context, i int) {
+			label, detail := "—", "网易云未返回播放次数"
+			if i < len(d.ranks) && d.ranks[i].PlayCount != nil && *d.ranks[i].PlayCount >= 0 {
+				label = fmt.Sprintf("%d 次", *d.ranks[i].PlayCount)
+				detail = "网易云统计的播放次数"
+			}
+			ui.Text(c, label).Width(104).TextAlign(ui.End).FontSize(12).FontFeatures("tnum").TextColor(a.pal.muted).Tooltip(detail)
 		}
 	}
 	a.trackRowsWithMeta(c, d.tracks, true, header, meta)

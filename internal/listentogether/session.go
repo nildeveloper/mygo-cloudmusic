@@ -25,6 +25,7 @@ type API interface {
 }
 
 type Playback struct {
+	Instance uint64 // changes on a new song or a fresh GOTO, not a resync
 	Queue    []netease.Track
 	Order    []int
 	Index    int  // index in Queue
@@ -75,6 +76,9 @@ type Session struct {
 	cancel       context.CancelFunc
 	timer        *time.Timer
 	beatTimer    *time.Timer
+	memberTimer  *time.Timer
+	checking     bool
+	watchMembers bool
 	beating      bool
 	beatSong     int64 // room song before metadata/audio is ready
 	epoch        uint64
@@ -82,6 +86,8 @@ type Session struct {
 	seq, version int64
 	playback     Playback
 	last         *netease.ListenCommand
+	pending      *netease.ListenCommand // accepted write awaiting a fresh snapshot
+	confirmAt    time.Time
 	lastBeat     time.Time
 	lastRead     time.Time
 	serverTime   int64
@@ -93,6 +99,29 @@ type Session struct {
 }
 
 var errPlaybackPending = errors.New("正在等待房间播放状态")
+var errCommandPending = errors.New("正在等待操作确认")
+
+// A successful write can precede its readable snapshot. Wait without replaying
+// the write, dropping queued controls or presenting a normal operation as an outage.
+func (s *Session) waitConfirmation() {
+	if time.Since(s.confirmAt) >= 8*time.Second {
+		s.pending = nil
+		s.fail(fmt.Errorf("暂未确认播放操作，请重新同步后重试"), time.Second)
+		return
+	}
+	s.changed(nil)
+	s.schedule(250 * time.Millisecond)
+}
+
+func confirmsCommand(before, sent, next *netease.ListenCommand) bool {
+	if next == nil || !validCommand(*next) {
+		return false
+	}
+	if before != nil && (sameCommand(*before, *next) || olderCommand(before, *next)) {
+		return false
+	}
+	return sent == nil || next.User != sent.User || next.ClientSeq >= sent.ClientSeq
+}
 
 func New(api API, uid int64, post func(func()), sample func() Playback, changed func(*Playback)) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -167,24 +196,24 @@ func (s *Session) Start(mode string, inv Invitation, seed Playback) {
 				}
 				return
 			}
-			s.State.Room = room
 			s.State.Connecting, s.State.Busy = false, false
-			if room.RoomID != "" {
-				if mode == "create" {
-					s.beatSong = seed.Song()
-				}
-				s.scheduleBeat(0)
-			}
 			if err != nil {
+				// Roll back partial startup rather than keeping an uninitialized
+				// room alive. A lost write response is not safe to blindly retry.
 				s.State.Error = err.Error()
-				if room.RoomID == "" {
-					s.State.Closed = true
-					s.cancel()
+				if room.RoomID != "" && mode != "resume" {
+					s.cleanup(room.RoomID)
 				}
+				s.Close()
 				s.changed(nil)
 				return
 			}
+			s.State.Room = room
+			if mode == "create" {
+				s.beatSong = seed.Song()
+			}
 			s.playback = Playback{Index: -1}
+			s.scheduleBeat(0)
 			s.poll()
 		})
 	}()
@@ -195,10 +224,10 @@ func trackIDs(tracks []netease.Track) []int64 {
 	for i, t := range tracks {
 		ids[i] = t.ID
 	}
-	return ids
+	return uniqueIDs(ids)
 }
 func terminal(err error) bool {
-	var e *netease.ListenError
+	var e *netease.ResponseError
 	return errors.As(err, &e) && (e.Code == 301 || e.Code == 488)
 }
 
@@ -286,6 +315,10 @@ func (s *Session) stopTimers() {
 		s.beatTimer.Stop()
 		s.beatTimer = nil
 	}
+	if s.memberTimer != nil {
+		s.memberTimer.Stop()
+		s.memberTimer = nil
+	}
 }
 
 func (s *Session) schedule(delay time.Duration) {
@@ -342,20 +375,14 @@ func (s *Session) heartbeat() {
 	}
 	s.beating = true
 	s.lastBeat = time.Now()
-	room := s.State.Room
+	room := s.State.Room.RoomID
+	s.members()
 	go func() {
 		ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
 		defer cancel()
 		start := time.Now()
-		h, err := s.api.Heartbeat(ctx, room.RoomID, local.Song(), local.Playing, local.Position.Milliseconds())
+		h, err := s.api.Heartbeat(ctx, room, local.Song(), local.Playing, local.Position.Milliseconds())
 		clockAt := start.Add(time.Since(start) / 2)
-		var status netease.ListenStatus
-		if err == nil {
-			status, err = s.api.Status(ctx)
-			if err == nil && (!status.InRoom || status.RoomInfo == nil || status.RoomInfo.RoomID != room.RoomID) {
-				err = &netease.ListenError{Code: 488, Message: "一起听已结束"}
-			}
-		}
 		s.post(func() {
 			s.beating = false
 			if s.ctx.Err() != nil || s.State.Leaving {
@@ -370,6 +397,58 @@ func (s *Session) heartbeat() {
 			}
 			if err != nil {
 				s.State.Error = err.Error()
+			}
+			s.changed(nil)
+		})
+	}()
+}
+
+// WatchMembers accelerates only membership reads while an invitation is shown.
+// Heartbeats and playback commands keep their own cadence and request budgets.
+func (s *Session) WatchMembers(watch bool) {
+	if s.watchMembers == watch {
+		return
+	}
+	s.watchMembers = watch
+	if s.memberTimer != nil {
+		s.memberTimer.Stop()
+		s.memberTimer = nil
+	}
+	if watch {
+		s.members()
+	}
+}
+
+func (s *Session) members() {
+	if s.State.Closed || s.State.Leaving || s.checking || s.State.Room.RoomID == "" || s.ctx.Err() != nil {
+		return
+	}
+	s.checking = true
+	if s.memberTimer != nil {
+		s.memberTimer.Stop()
+		s.memberTimer = nil
+	}
+	room := s.State.Room.RoomID
+	go func() {
+		ctx, cancel := context.WithTimeout(s.ctx, 3*time.Second)
+		defer cancel()
+		status, err := s.api.Status(ctx)
+		if err == nil && (!status.InRoom || status.RoomInfo == nil || status.RoomInfo.RoomID != room) {
+			err = &netease.ResponseError{Code: 488, Message: "一起听已结束"}
+		}
+		s.post(func() {
+			s.checking = false
+			if s.ctx.Err() != nil || s.State.Leaving {
+				return
+			}
+			if terminal(err) {
+				s.fail(err, 0)
+				return
+			}
+			delay := time.Second
+			if err != nil {
+				s.State.Error = err.Error()
+				delay = 3 * time.Second
 			} else {
 				updated := *status.RoomInfo
 				if updated.CreatorID == 0 {
@@ -378,6 +457,15 @@ func (s *Session) heartbeat() {
 				s.State.Room = updated
 			}
 			s.changed(nil)
+			if s.watchMembers && !s.State.Closed && !s.State.Leaving {
+				s.memberTimer = time.AfterFunc(delay, func() {
+					s.post(func() {
+						if s.watchMembers {
+							s.members()
+						}
+					})
+				})
+			}
 		})
 	}()
 }
@@ -393,6 +481,9 @@ func (s *Session) Retry() {
 	s.drain()
 }
 
+// Playing is the last confirmed room state, independent of this device's output.
+func (s *Session) Playing() bool { return s.playback.Playing }
+
 func (s *Session) poll() {
 	if s.State.Busy || s.State.Closed || s.State.Room.RoomID == "" {
 		return
@@ -401,17 +492,14 @@ func (s *Session) poll() {
 	room := s.State.Room.RoomID
 	local := s.sample()
 	previous := s.playback
-	last := s.last
 	prior := s.last
+	pending := s.pending
 	if needsAlignment(local, previous, time.Now()) {
 		s.alignMisses++
 	} else {
 		s.alignMisses = 0
 	}
 	resync := s.State.Reconnecting || s.alignMisses >= 2 || time.Since(s.lastRead) > 15*time.Second || !s.clockAt.IsZero() && !s.clockAligned
-	if resync {
-		last = nil
-	}
 	epoch := s.epoch
 	serverTime, clockAt := s.serverTime, s.clockAt
 	needBeatSong := s.beatTimer != nil && s.beatSong == 0 && previous.Song() == 0
@@ -428,40 +516,46 @@ func (s *Session) poll() {
 			})
 		}
 		var next *Playback
-		// Commands are not samples: repeated GOTO/PROGRESS must not restart playback.
-		if err == nil && snap.Command != nil {
-			cmd := *snap.Command
-			if validCommand(cmd) {
-				if olderCommand(prior, cmd) && resync {
-					err = fmt.Errorf("等待房间最新播放状态")
-				} else if !olderCommand(prior, cmd) && (last == nil || !sameCommand(*last, cmd) || queueChanged(previous, snap)) {
-					var p Playback
-					p, err = resolve(s.ctx, s.api, previous, snap, serverTime, clockAt)
-					if err == nil {
-						next = &p
-					}
-				}
-			} else {
+		// Commands are not samples: only resync, a new command or a queue
+		// change can apply playback. Pending writes still need confirmation.
+		if err == nil {
+			cmd := snap.Command
+			switch {
+			case pending != nil && !confirmsCommand(prior, pending, cmd):
+				err = errCommandPending
+			case cmd == nil || !validCommand(*cmd):
 				err = errPlaybackPending
+			case olderCommand(prior, *cmd):
+				if resync {
+					err = errors.New("等待房间最新播放状态")
+				}
+			case resync || prior == nil || !sameCommand(*prior, *cmd) || queueChanged(previous, snap):
+				var p Playback
+				p, err = resolve(s.ctx, s.api, previous, prior, snap, serverTime, clockAt)
+				if err == nil {
+					next = &p
+				}
 			}
-		} else if err == nil {
-			err = errPlaybackPending
 		}
 		s.post(func() {
 			if s.ctx.Err() != nil {
 				return
 			}
 			s.State.Busy = false
-			if s.State.Leaving {
-				s.drain()
+			if s.State.Leaving || epoch != s.epoch {
+				s.drain() // A local command superseded this read.
 				return
 			}
-			if epoch != s.epoch {
-				s.drain()
-				return
-			} // A local command superseded this read.
 			if err != nil {
+				if errors.Is(err, errCommandPending) {
+					s.waitConfirmation()
+					return
+				}
 				if errors.Is(err, errPlaybackPending) {
+					if s.last != nil && time.Since(s.lastRead) < 8*time.Second {
+						s.schedule(500 * time.Millisecond)
+						return
+					}
 					s.fail(err, 2*time.Second)
 					return
 				}
@@ -469,13 +563,14 @@ func (s *Session) poll() {
 				s.fail(err, time.Duration(min(30, 2<<min(s.failures, 4)))*time.Second)
 				return
 			}
+			s.pending = nil
 			s.failures = 0
 			s.lastRead = time.Now()
 			s.State.Error = ""
 			s.State.Reconnecting = false
 			s.State.Syncing = false
 			if next != nil {
-				s.accept(*next, *snap.Command)
+				*next = s.accept(*next, *snap.Command)
 				s.clockAligned = s.clockAligned || !clockAt.IsZero()
 			}
 			s.changed(next)
@@ -524,7 +619,7 @@ func (s *Session) drain() {
 		s.endRoom()
 		return
 	}
-	if s.State.Syncing {
+	if s.State.Syncing || s.pending != nil {
 		s.poll()
 		return
 	}
@@ -637,6 +732,7 @@ func (s *Session) drain() {
 		if err == nil {
 			err = s.api.Play(s.ctx, room, cmd)
 		}
+		wrote := err == nil
 		// Read the acknowledged state: another participant may have raced our write.
 		var snap netease.ListenSnapshot
 		var next Playback
@@ -644,10 +740,10 @@ func (s *Session) drain() {
 			snap, err = s.api.Snapshot(s.ctx, room)
 		}
 		if err == nil {
-			if snap.Command == nil || !validCommand(*snap.Command) || (before != nil && sameCommand(*before, *snap.Command)) || olderCommand(before, *snap.Command) {
-				err = fmt.Errorf("等待指令确认")
+			if !confirmsCommand(before, &cmd, snap.Command) {
+				err = errCommandPending
 			} else {
-				next, err = resolve(s.ctx, s.api, p, snap, serverTime, clockAt)
+				next, err = resolve(s.ctx, s.api, p, before, snap, serverTime, clockAt)
 			}
 		}
 		s.post(func() {
@@ -655,16 +751,24 @@ func (s *Session) drain() {
 				return
 			}
 			s.State.Busy = false
+			if wrote && err != nil {
+				s.pending, s.confirmAt = &cmd, time.Now()
+			}
 			if s.State.Leaving || s.State.Syncing {
 				s.drain()
 				return
 			}
 			if err != nil {
+				if errors.Is(err, errCommandPending) {
+					s.waitConfirmation()
+					return
+				}
 				s.fail(err, time.Second)
 				return
 			}
+			s.pending = nil
 			s.State.Error = ""
-			s.accept(next, *snap.Command)
+			next = s.accept(next, *snap.Command)
 			s.clockAligned = s.clockAligned || !clockAt.IsZero()
 			s.changed(&next)
 			s.drain()
@@ -672,7 +776,7 @@ func (s *Session) drain() {
 	}()
 }
 
-func (s *Session) accept(p Playback, cmd netease.ListenCommand) {
+func (s *Session) accept(p Playback, cmd netease.ListenCommand) Playback {
 	fresh := s.last == nil || !sameCommand(*s.last, cmd)
 	if fresh && (cmd.Type == "PROGRESS" || cmd.Type == "SEEK") {
 		// EOFs from the old position must not override the acknowledged seek.
@@ -684,5 +788,7 @@ func (s *Session) accept(p Playback, cmd netease.ListenCommand) {
 	if p.Song() != s.playback.Song() || cmd.Type == "GOTO" && fresh {
 		s.trackEpoch++
 	}
+	p.Instance = s.trackEpoch
 	s.playback, s.last = p, &cmd
+	return p
 }

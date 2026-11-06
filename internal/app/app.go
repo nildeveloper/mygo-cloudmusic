@@ -122,11 +122,12 @@ type app struct {
 	fmMode        int    // the FM mode chosen, in fmModes
 	radioStarting string // the radio asked for its first songs, or ""
 
-	scrub      float64
-	scrubbing  bool
-	volume     float64
-	volumeOpen bool // the volume popover of the player bar shows
-	mutedFrom  float64
+	scrub         float64
+	scrubbing     bool
+	volume        float64
+	volumeOpen    bool // the volume popover of the player bar shows
+	playbackError playbackErrorState
+	mutedFrom     float64
 
 	rowBars barState
 	// underTop and underBottom say whether the page has content under its

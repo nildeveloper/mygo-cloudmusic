@@ -265,8 +265,8 @@ func (a *app) settingsView(c *ui.Context) {
 			})
 		})
 
-		if a.updates {
-			group("更新", func() {
+		group("更新", func() {
+			if a.updates {
 				desc := "每天检查一次是否有新版本"
 				if t := lastUpdateCheck(); !t.IsZero() {
 					desc += "；上次检查：" + commentTime(t, time.Now())
@@ -283,12 +283,16 @@ func (a *app) settingsView(c *ui.Context) {
 						setUpdateDownloads(on)
 					}
 				})
-				row("当前版本 "+mygo.App.Version(), "", func() {
-					if ui.Button(c.Key("check-updates"), "检查更新").Clicked() {
-						checkForUpdates()
-					}
-				})
+			}
+			desc := ""
+			if !a.updates {
+				desc = "前往本项目的 GitHub 发布页下载新版本"
+			}
+			row("当前版本 "+mygo.App.Version(), desc, func() {
+				if ui.Button(c.Key("check-updates"), "检查更新").Clicked() {
+					a.checkUpdates()
+				}
 			})
-		}
+		})
 	})
 }

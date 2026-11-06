@@ -40,14 +40,23 @@ func sameCommand(a, b netease.ListenCommand) bool {
 // A queue replacement and its GOTO are separate writes. Until both arrive,
 // retain the current song and compare the same normalized lists we apply.
 func withCurrentSong(ids []netease.ListenID, current netease.ListenID) []int64 {
-	list := make([]int64, len(ids))
+	list := make([]int64, len(ids)+1)
 	for i, id := range ids {
 		list[i] = int64(id)
 	}
-	if !slices.Contains(list, int64(current)) {
-		list = append(list, int64(current))
-	}
-	return list
+	list[len(ids)] = int64(current)
+	return uniqueIDs(list)
+}
+
+// Room commands identify songs, not occurrences. Compact owned ID lists in
+// first-seen order; history rows and the personal queue retain their duplicates.
+func uniqueIDs(ids []int64) []int64 {
+	seen := make(map[int64]bool, len(ids))
+	return slices.DeleteFunc(ids, func(id int64) bool {
+		duplicate := seen[id]
+		seen[id] = true
+		return duplicate
+	})
 }
 
 func queueChanged(p Playback, s netease.ListenSnapshot) bool {
@@ -77,7 +86,7 @@ func queueChanged(p Playback, s netease.ListenSnapshot) bool {
 	return false
 }
 
-func resolve(ctx context.Context, api API, old Playback, snap netease.ListenSnapshot, server int64, at time.Time) (Playback, error) {
+func resolve(ctx context.Context, api API, old Playback, previous *netease.ListenCommand, snap netease.ListenSnapshot, server int64, at time.Time) (Playback, error) {
 	c := snap.Command
 	p := Playback{
 		Queue: slices.Clone(old.Queue), Index: -1, Mode: old.Mode,
@@ -165,9 +174,15 @@ func resolve(ctx context.Context, api API, old Playback, snap netease.ListenSnap
 	}
 	// The server clock avoids trusting the local wall clock. Its relationship
 	// to serverSeq is provisional; clamp to the track and never auto-skip here.
-	p.Position = commandPosition(*c, server, at, time.Now())
+	now := time.Now()
+	p.Position = commandPosition(*c, server, at, now)
+	if (server <= 0 || at.IsZero() || c.ServerSeq <= 0) && previous != nil && sameCommand(*previous, *c) {
+		// A repeated command is not a fresh position sample. Until the server
+		// clock arrives, retain the monotonic anchor already used for playback.
+		p.Position = old.At(now)
+	}
 	p.Position = min(p.Position, max(0, p.Queue[p.Index].Length()-time.Millisecond))
-	p.Sampled = time.Now()
+	p.Sampled = now
 	return p, nil
 }
 

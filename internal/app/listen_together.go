@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"slices"
 	"time"
 
@@ -13,14 +14,22 @@ import (
 
 type togetherPlayer struct {
 	session     *listentogether.Session
+	client      *netease.ListenClient
+	report      *togetherReport
 	personal    player.Session
 	hadPersonal bool
 	open        bool
+	joining     bool
 	invite      string
 	err         string
 	shareLink   string
 	shareCode   *qr.Code
 	shareOnJoin bool
+}
+
+type togetherReport struct {
+	data   *netease.ListenReport
+	cancel context.CancelFunc
 }
 
 func (a *app) togetherSample() listentogether.Playback {
@@ -39,7 +48,7 @@ func (a *app) togetherSample() listentogether.Playback {
 	ready := p.Ready() && !p.Loading()
 	return listentogether.Playback{
 		Mode: mode, Queue: slices.Clone(p.Queue()), Order: slices.Clone(order), Index: index,
-		Ready: ready, Playing: p.Playing() && ready, Position: p.Position(), Sampled: time.Now(),
+		Ready: ready, Playing: p.Playing() && p.OutputPlaying() && ready, Position: p.Position(), Sampled: time.Now(),
 	}
 }
 func (a *app) startTogether(mode string) {
@@ -75,11 +84,13 @@ func (a *app) startTogether(mode string) {
 		}
 	}
 	t.personal, t.hadPersonal = a.pl.Session()
+	a.clearTogetherReport()
 	t.err = ""
 	t.shareOnJoin = mode == "create"
+	t.client = netease.NewListenClient()
 	a.radioStarting = ""
 	var session *listentogether.Session
-	session = listentogether.New(netease.NewListenClient(), a.profile.UserID, a.post, a.togetherSample, func(next *listentogether.Playback) {
+	session = listentogether.New(t.client, a.profile.UserID, a.post, a.togetherSample, func(next *listentogether.Playback) {
 		a.togetherChanged(session, next)
 	})
 	t.session = session
@@ -94,9 +105,13 @@ func (a *app) togetherChanged(session *listentogether.Session, next *listentoget
 	}
 	if session.State.Closed {
 		err, joined := session.State.Error, session.State.Room.RoomID != ""
+		client, room := a.together.client, session.State.Room.RoomID
 		a.stopTogether()
 		if joined {
 			a.toast = "一起听已结束"
+			if client != nil && a.profile != nil && !a.quitting {
+				a.loadTogetherReport(client, room)
+			}
 		} else if err != "" {
 			a.together.err, a.together.open = err, true
 		}
@@ -104,7 +119,8 @@ func (a *app) togetherChanged(session *listentogether.Session, next *listentoget
 	}
 	if next != nil {
 		a.pl.Apply(player.Playback{
-			Queue: next.Queue, Order: next.Order, Index: next.Index, Mode: next.Mode,
+			Instance: next.Instance,
+			Queue:    next.Queue, Order: next.Order, Index: next.Index, Mode: next.Mode,
 			Playing: next.Playing, Position: next.At(time.Now()),
 		})
 		if a.together.shareOnJoin {
@@ -112,10 +128,63 @@ func (a *app) togetherChanged(session *listentogether.Session, next *listentoget
 			a.showTogetherInvitation()
 		}
 	}
+	if a.togetherPeer() != nil && a.together.shareCode != nil {
+		a.dismissTogetherInvitation()
+	}
+}
+
+func (a *app) clearTogetherReport() {
+	if r := a.together.report; r != nil {
+		r.cancel()
+		a.together.report = nil
+		a.together.open = false
+	}
+}
+
+// The room is already closed and personal playback restored. This bounded
+// read uses its original login and cannot delay or undo that cleanup.
+func (a *app) loadTogetherReport(client *netease.ListenClient, room string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	r := &togetherReport{cancel: cancel}
+	a.together.report = r
+	profile := a.profile
+	go func() {
+		data, err := client.Report(ctx, room)
+		cancel()
+		a.post(func() { a.finishTogetherReport(r, profile, data, err) })
+	}()
+}
+
+func (a *app) finishTogetherReport(r *togetherReport, profile *netease.Profile, data netease.ListenReport, err error) {
+	if a.together.report != r || a.profile != profile || a.quitting || a.together.session != nil {
+		return
+	}
+	if err != nil || a.login.open {
+		a.clearTogetherReport()
+		return // The existing end toast is sufficient when no report is available.
+	}
+	r.data = &data
+	a.together.open = true
+}
+
+// Membership updates arrive independently of playback commands.
+func (a *app) togetherPeer() *netease.ListenUser {
+	if a.profile == nil || a.together.session == nil {
+		return nil
+	}
+	for i := range a.together.session.State.Room.Users {
+		user := &a.together.session.State.Room.Users[i]
+		if user.UserID > 0 && int64(user.UserID) != a.profile.UserID {
+			return user
+		}
+	}
+	return nil
 }
 
 func (a *app) stopTogether() {
 	t := &a.together
+	a.clearTogetherReport()
+	t.client = nil
 	if t.session == nil {
 		return
 	}
@@ -146,6 +215,10 @@ func (a *app) togetherCommand(c player.Command) bool {
 	s := a.together.session
 	if s == nil {
 		return false
+	}
+	if a.pl.Err() != "" && !a.pl.Ready() && s.Playing() && (c.Kind == "toggle" || c.Kind == "playing" && c.Playing) {
+		s.Retry() // Recover this output from the room snapshot, without pausing the peer.
+		return true
 	}
 	action := listentogether.Action{}
 	switch c.Kind {
@@ -200,6 +273,12 @@ func (a *app) togetherButton(c *ui.Context, color ui.Color) {
 	if a.together.session != nil {
 		b.Menu(a.togetherMenu)
 	} else if b.Clicked() {
-		a.together.open = true
+		a.openTogether()
 	}
+}
+
+func (a *app) openTogether() {
+	a.clearTogetherReport()
+	a.together.joining, a.together.err = false, ""
+	a.together.open = true
 }
