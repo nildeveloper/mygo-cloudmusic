@@ -85,6 +85,12 @@ func eapiPost(path string, data map[string]any, out any) error {
 // eapiRequest can bind a cancellable operation to a captured login. Room
 // requests never write cookies back into a subsequently changed account.
 func eapiRequest(ctx context.Context, path string, data map[string]any, out any, cookies []*http.Cookie, saveCookies bool) error {
+	return eapiRequestAt(ctx, path, data, out, cookies, saveCookies, eapiTarget{domain: eapiDomain})
+}
+
+type eapiTarget struct{ domain, os string }
+
+func eapiRequestAt(ctx context.Context, path string, data map[string]any, out any, cookies []*http.Cookie, saveCookies bool, target eapiTarget) error {
 	header := map[string]string{
 		"osver":       eapiClient["osver"],
 		"deviceId":    device(),
@@ -106,13 +112,16 @@ func eapiRequest(ctx context.Context, path string, data map[string]any, out any,
 			header["__csrf"] = c.Value
 		}
 	}
+	if target.os != "" {
+		header["os"] = target.os
+	}
 	data["header"] = header
 	data["e_r"] = false
 	params, err := eapiEncrypt(path, data)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", eapiDomain+"/eapi/"+strings.TrimPrefix(path, "/api/"),
+	req, err := http.NewRequestWithContext(ctx, "POST", target.domain+"/eapi/"+strings.TrimPrefix(path, "/api/"),
 		strings.NewReader(url.Values{"params": {params}}.Encode()))
 	if err != nil {
 		return err
@@ -155,6 +164,9 @@ func eapiRequest(ctx context.Context, path string, data map[string]any, out any,
 		}
 		if message == "" {
 			message = http.StatusText(res.StatusCode)
+		}
+		if target.domain != eapiDomain {
+			return fmt.Errorf("netease: %s: code %d %s", path, code, message)
 		}
 		return &ListenError{Code: code, Message: message}
 	}

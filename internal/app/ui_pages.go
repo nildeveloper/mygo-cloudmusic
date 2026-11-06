@@ -334,6 +334,12 @@ func (a *app) playlistHeader(c *ui.Context, pl *netease.Playlist) {
 // trackRows lists tracks under a header, which scrolls with them; a click
 // plays the list from the track clicked.
 func (a *app) trackRows(c *ui.Context, tracks []netease.Track, covers bool, header func(c *ui.Context), footer ...func(c *ui.Context)) {
+	a.trackRowsWithMeta(c, tracks, covers, header, nil, footer...)
+}
+
+// trackRowsWithMeta optionally replaces the duration with page-specific row
+// information, keeping playback and song menus shared with other song lists.
+func (a *app) trackRowsWithMeta(c *ui.Context, tracks []netease.Track, covers bool, header func(c *ui.Context), meta func(*ui.Context, int), footer ...func(c *ui.Context)) {
 	p := a.pal
 	cur := a.pl.Current()
 	// A song's menu can take it out of the playlist it is listed in.
@@ -431,7 +437,11 @@ func (a *app) trackRows(c *ui.Context, tracks []netease.Track, covers bool, head
 					a.likeButton(c.Key("like"), tr, 15, p.muted)
 				}
 			})
-			ui.Text(c, clock(tr.Length())).FontSize(12.5).FontFeatures("tnum").TextColor(p.faint).Width(44).TextAlign(ui.End)
+			if meta != nil {
+				meta(c, i)
+			} else {
+				ui.Text(c, clock(tr.Length())).FontSize(12.5).FontFeatures("tnum").TextColor(p.faint).Width(44).TextAlign(ui.End)
+			}
 		})
 		if row.Clicked() && tr.Playable() {
 			a.pl.PlayQueue(tracks, i)

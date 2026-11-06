@@ -50,6 +50,8 @@ func (a *app) signedIn(prof *netease.Profile) {
 		a.stopTogether()
 	}
 	a.profile = prof
+	a.resetScrobbler(prof)
+	a.records = recordState{}
 	// Playback picks up where it was left, once the session that lets
 	// the listener play their songs is back.
 	a.restoreSession()

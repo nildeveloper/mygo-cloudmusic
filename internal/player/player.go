@@ -37,6 +37,9 @@ type Player struct {
 	// plays changed.
 	Changed func()
 	Control func(Command) bool
+	// Listened observes audio actually consumed, independently of controls.
+	Listened  func(ListeningEvent)
+	listening listeningClock
 
 	queue   []netease.Track
 	order   []int // the queue's indices in play order: shuffled or not
@@ -109,6 +112,7 @@ func (p *Player) notifyChanged() {
 // sync shows the system, and Changed, where playback is.
 func (p *Player) sync() {
 	defer p.notifyChanged()
+	p.PollListening()
 	if p.track == nil {
 		mygo.NowPlaying.Clear()
 		return
@@ -139,11 +143,12 @@ func (p *Player) announce(t *netease.Track, artwork []byte) {
 }
 
 func (p *Player) ended() {
+	p.FinishListening()
 	if p.dispatch(Command{Kind: "ended"}) {
 		return
 	}
 	if p.repeat == RepeatOne {
-		p.out.Seek(0)
+		p.seekOutput(0)
 		p.out.Play()
 		p.sync()
 		return
@@ -498,7 +503,7 @@ func (p *Player) togglePlay() {
 	p.playing = true
 	if !p.seeking && !out.Playing() {
 		if out.Position() >= out.Duration()-time.Second {
-			out.Seek(0)
+			p.seekOutput(0)
 		}
 		out.Play()
 	}
@@ -530,7 +535,7 @@ func (p *Player) seek(t time.Duration) {
 	// Paused, it jumps at once; but a seek on its way paused it only for
 	// the jump, and this one takes its place, playing on from there.
 	if !out.Playing() && !p.seeking {
-		out.Seek(t)
+		p.seekOutput(t)
 		// EOF stops the output without clearing externally managed intent.
 		if p.playing {
 			out.Play()
@@ -549,7 +554,7 @@ func (p *Player) seek(t time.Duration) {
 				return
 			}
 			p.seeking = false
-			out.Seek(t)
+			p.seekOutput(t)
 			if p.playing || !p.fade.silent() {
 				out.Play()
 			}
@@ -619,6 +624,7 @@ func (p *Player) Levels() ([Bands]float32, bool) {
 }
 
 func (p *Player) stop() {
+	p.FinishListening()
 	if out := p.out; out != nil {
 		// Paused first, it fades out over a few milliseconds, rather than
 		// stopping with a click.
@@ -732,7 +738,7 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 				p.pending = min(p.pending, max(0, p.Duration()-time.Millisecond))
 			}
 			if p.pending > 0 {
-				p.out.Seek(p.pending)
+				p.seekOutput(p.pending)
 				p.pending = 0
 			}
 			if p.playing {
