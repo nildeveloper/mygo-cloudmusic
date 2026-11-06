@@ -26,7 +26,7 @@ func (a *app) view(c *ui.Context) {
 		c.Root().Background(ui.Transparent)
 	}
 	root := ui.Box(c).Fill()
-	if !c.Focused(a.searchBox) {
+	if !c.Focused(a.searchBox) && !a.together.open {
 		// Space plays and pauses wherever the focus is, as in Music. On
 		// the container around everything, it comes before a button the
 		// pointer focused, which would take Space as a click; on the
@@ -65,6 +65,7 @@ func (a *app) view(c *ui.Context) {
 		a.nowPlayingLayer(c, npOpen, npSettled)
 	})
 	a.loginDialog(c)
+	a.togetherDialog(c)
 	a.playlistNameDialog(c)
 	a.deletePlaylistDialog(c)
 	if a.toast != "" {

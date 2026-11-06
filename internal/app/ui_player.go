@@ -361,7 +361,7 @@ func (a *app) playerBar(c *ui.Context) {
 	// The controls keep the middle, between sides that share what is left:
 	// narrower, the middle gives up to 140 DIPs, and what plays keeps room
 	// for its cover, some of its title and its heart.
-	const controls = 3*32 + 2*4 // lyrics, queue and the speaker
+	const controls = 4*32 + 3*4 // lyrics, queue and the speaker
 	ui.Row(c).Absolute().Left(0).Right(0).Bottom(0).Height(playerBarHeight).PaddingX(20).Gap(20).AlignItems(ui.Center).Children(func() {
 		// What plays.
 		ui.Row(c).Grow(1).Basis(0).MinWidth(150).Children(func() {
@@ -422,8 +422,9 @@ func (a *app) playerBar(c *ui.Context) {
 			})
 		})
 
-		// Lyrics and volume.
+		// Together, lyrics and volume.
 		ui.Row(c).Grow(1).Basis(0).MinWidth(controls).Justify(ui.End).AlignItems(ui.Center).Gap(4).Children(func() {
+			a.togetherButton(c, p.muted)
 			lyr := p.muted
 			if a.nowPlaying {
 				lyr = p.accent

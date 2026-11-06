@@ -2,6 +2,7 @@ package netease
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/md5"
 	"crypto/rand"
@@ -78,6 +79,12 @@ func device() string {
 // data, and decodes the JSON it answers into out. The cookies it sets, the
 // session's among them, go in the jar.
 func eapiPost(path string, data map[string]any, out any) error {
+	return eapiRequest(context.Background(), path, data, out, httpClient.Jar.Cookies(siteURL), true)
+}
+
+// eapiRequest can bind a cancellable operation to a captured login. Room
+// requests never write cookies back into a subsequently changed account.
+func eapiRequest(ctx context.Context, path string, data map[string]any, out any, cookies []*http.Cookie, saveCookies bool) error {
 	header := map[string]string{
 		"osver":       eapiClient["osver"],
 		"deviceId":    device(),
@@ -91,7 +98,7 @@ func eapiPost(path string, data map[string]any, out any) error {
 		"requestId":   fmt.Sprintf("%d_%04d", time.Now().UnixMilli(), time.Now().Nanosecond()%1000),
 		"__csrf":      "",
 	}
-	for _, c := range httpClient.Jar.Cookies(siteURL) {
+	for _, c := range cookies {
 		switch c.Name {
 		case "MUSIC_U", "NMTID":
 			header[c.Name] = c.Value
@@ -105,7 +112,7 @@ func eapiPost(path string, data map[string]any, out any) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest("POST", eapiDomain+"/eapi/"+strings.TrimPrefix(path, "/api/"),
+	req, err := http.NewRequestWithContext(ctx, "POST", eapiDomain+"/eapi/"+strings.TrimPrefix(path, "/api/"),
 		strings.NewReader(url.Values{"params": {params}}.Encode()))
 	if err != nil {
 		return err
@@ -124,7 +131,7 @@ func eapiPost(path string, data map[string]any, out any) error {
 	}
 	defer res.Body.Close()
 	// Keep what it sets for the site, whichever host set it.
-	if set := res.Cookies(); len(set) > 0 {
+	if set := res.Cookies(); saveCookies && ctx.Err() == nil && len(set) > 0 {
 		for _, c := range set {
 			c.Domain = ""
 			c.Path = "/"
@@ -134,6 +141,22 @@ func eapiPost(path string, data map[string]any, out any) error {
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return err
+	}
+	if !saveCookies && (res.StatusCode < 200 || res.StatusCode >= 300) {
+		var api apiError
+		_ = json.Unmarshal(body, &api)
+		code := res.StatusCode
+		if api.Code != 0 && api.Code != 200 {
+			code = api.Code
+		}
+		message := api.Message
+		if message == "" {
+			message = api.Msg
+		}
+		if message == "" {
+			message = http.StatusText(res.StatusCode)
+		}
+		return &ListenError{Code: code, Message: message}
 	}
 	return json.Unmarshal(body, out)
 }

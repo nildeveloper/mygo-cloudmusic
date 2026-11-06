@@ -26,7 +26,16 @@ func sessionPath() (string, error) {
 // saveSession keeps where playback is, if it moved on since last kept.
 func (a *app) saveSession() {
 	s, ok := a.pl.Session()
+	if a.together.session != nil {
+		s, ok = a.together.personal, a.together.hadPersonal
+	}
 	if !ok {
+		if a.together.session != nil {
+			if path, err := sessionPath(); err == nil {
+				_ = os.Remove(path)
+				a.savedSession = ""
+			}
+		}
 		return
 	}
 	b, err := json.Marshal(s)

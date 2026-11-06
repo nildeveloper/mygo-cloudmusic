@@ -42,6 +42,7 @@ type app struct {
 	win          *mygo.Window
 	notch        *notch
 	systemPlayer *systemPlayer
+	together     togetherPlayer
 	tray         *mygo.Tray // the icon in the menu bar or notification area, while it shows
 	art          *artCache
 	pl           *player.Player
@@ -279,6 +280,7 @@ func Run() error {
 	})
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
 		a.quitting = true
+		a.stopTogether()
 		a.systemPlayer.close()
 		a.settings.Volume = a.volume
 		a.settings.save()

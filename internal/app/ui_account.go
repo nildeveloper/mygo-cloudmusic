@@ -46,6 +46,9 @@ func (a *app) boot() {
 
 // signedIn shows what is personal to prof, or to nobody.
 func (a *app) signedIn(prof *netease.Profile) {
+	if a.profile != nil && (prof == nil || prof.UserID != a.profile.UserID) {
+		a.stopTogether()
+	}
 	a.profile = prof
 	// Playback picks up where it was left, once the session that lets
 	// the listener play their songs is back.

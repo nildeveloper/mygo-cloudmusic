@@ -155,6 +155,13 @@ func (a *app) nowPlayingBody(c *ui.Context, tr *netease.Track, art *artwork, acc
 		// The cover leaves room above it for the tabs, starting as far
 		// under them as the wall's song does.
 		coverSize := min(side, h-436)
+		if a.together.session != nil {
+			presenceHeight := float32(82)
+			if h < 700 {
+				presenceHeight = 44
+			}
+			coverSize = min(side, h-436-presenceHeight)
+		}
 		// The column is as wide as the cover, for the cover, what plays
 		// and the tabs over it to start at one edge, but wide enough for
 		// the controls.
@@ -164,8 +171,13 @@ func (a *app) nowPlayingBody(c *ui.Context, tr *netease.Track, art *artwork, acc
 		ui.Row(c).Grow(1).Padding(0, padX, 44, padX).Gap(72).AlignItems(ui.Stretch).Children(func() {
 			var coverTop float32
 			ui.Column(c).Width(side).Justify(ui.Center).Gap(0).Children(func() {
+				a.togetherPresence(c, h < 700)
 				coverTop = ui.Box(c.Key("cover-top")).Height(0).LayoutBounds().Y
-				a.npCover(c, tr, art, coverSize)
+				coverAlign := ui.Start
+				if a.together.session != nil {
+					coverAlign = ui.Center
+				}
+				ui.Row(c).Justify(coverAlign).Children(func() { a.npCover(c, tr, art, coverSize) })
 
 				ui.Row(c).Gap(8).AlignItems(ui.Center).Margin(36, 0, 18, 0).Children(func() {
 					ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(4).Children(func() {
